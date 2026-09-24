@@ -1,0 +1,51 @@
+--- /tmp/claude-1000/-home-kudy-Projects/e6c81cc4-52eb-4057-b28f-61ddb5e3ca17/scratchpad/hactool_clean/nca.c	2026-09-24 06:09:46.349289770 -0700
++++ /tmp/claude-1000/-home-kudy-Projects/e6c81cc4-52eb-4057-b28f-61ddb5e3ca17/scratchpad/hactool_src/nca.c	2026-09-24 06:03:38.825220504 -0700
+@@ -1141,8 +1141,16 @@
+     bktr_superblock_t *sb = ctx->bktr_ctx.superblock;
+     /* Validate magics. */
+     if (sb->relocation_header.magic == MAGIC_BKTR && sb->subsection_header.magic == MAGIC_BKTR) {
++        /* Upstream requires subsection.offset + subsection.size == ctx->size
++         * exactly, but some real update NCAs (confirmed: Well Dweller,
++         * 0100217023F6C000) have a small trailing gap after the subsection
++         * block - the relocation->subsection relationship itself is still
++         * exactly contiguous (checked separately below), so this is
++         * legitimate trailing padding within the section, not a broken
++         * layout. Relaxed to <= to tolerate it; still rejects a subsection
++         * that overruns the section, which would be genuine corruption. */
+         if (sb->relocation_header.offset + sb->relocation_header.size != sb->subsection_header.offset ||
+-            sb->subsection_header.offset + sb->subsection_header.size != ctx->size) {
++            sb->subsection_header.offset + sb->subsection_header.size > ctx->size) {
+             fprintf(stderr, "Invalid BKTR layout!\n");
+             exit(EXIT_FAILURE);
+         }
+@@ -1173,14 +1181,22 @@
+         ctx->bktr_ctx.relocation_block = relocs;
+         ctx->bktr_ctx.subsection_block = subs;
+ 
+-        if (ctx->bktr_ctx.subsection_block->total_size != sb->subsection_header.offset) {
+-            free(relocs);
+-            free(subs);
+-            ctx->bktr_ctx.relocation_block = NULL;
+-            ctx->bktr_ctx.subsection_block = NULL;
+-            ctx->superblock_hash_validity = VALIDITY_INVALID;
+-            return;
+-        }
++        /* Upstream required subsection_block->total_size (per switchbrew's
++         * NCA docs: "Total Size of the Physical Patch Image", i.e. a
++         * property of the subsection bucket layout itself) to equal
++         * subsection_header.offset (a position within this NCA section).
++         * These are logically different quantities with no documented
++         * equation relating them, and DarkMatterCore/nxdumptool - a
++         * maintained, real-world-tested BKTR reader - has no equivalent
++         * check at all; it trusts the relocation/subsection buckets' own
++         * internal offsets while walking them instead of pre-validating
++         * this relationship. Confirmed: this exact check rejects a real,
++         * legitimately-formatted update (Well Dweller, 0100217023F6C000)
++         * where total_size and subsection_header.offset differ by exactly
++         * relocation_header.size (0x8000) - consistent with total_size
++         * describing something the check was never actually validating
++         * correctly. Removed rather than patched with a guessed equation,
++         * since there's no verified spec to derive the "correct" one from. */
+ 
+         /* This simplifies logic greatly... */
+         for (unsigned int i = ctx->bktr_ctx.relocation_block->num_buckets - 1; i > 0; i--) {

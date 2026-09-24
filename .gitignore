@@ -1,0 +1,16 @@
+# Game files (copyrighted, and huge) - never commit these.
+*.nsp
+*.nsz
+*.xci
+*.xcz
+
+# Merge output - regenerate on demand from your own base/update/DLC files.
+/merged/
+
+# hacpack's own auto-generated build-cache backups.
+/hacpack_backup/
+
+# Keys - never commit these under any circumstances.
+*.keys
+prod.keys*
+title.keys*
