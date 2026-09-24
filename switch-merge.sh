@@ -2,7 +2,11 @@
 # Merge one or more Switch base-game NSPs, each with (optionally) its own
 # update NSP and (optionally) any number of DLC NSPs, into one installable
 # NSP per title (1G1R: one game, one ROM).
-# Usage: switch-merge.sh -o <output_dir> [-k keys.dat] <nsp-or-dir> ...
+# Usage: switch-merge.sh [-o <output_dir>] [-k keys.dat] [<nsp-or-dir> ...]
+#
+# With no positional inputs, defaults to scanning the directory this script
+# itself lives in, and to "<script dir>/merged" as the output directory -
+# so plain `./switch-merge.sh` with no args just works.
 #
 # Base/update/DLC are auto-detected from each NSP's own cnmt content-meta
 # Type field (Application/Patch/AddOnContent) - not from filenames - and
@@ -29,11 +33,11 @@ if [ -d "$SCRIPT_DIR/bin" ]; then
 fi
 
 KEYS="$HOME/.switch/prod.keys"
-OUT_DIR="."
+OUT_DIR="$SCRIPT_DIR/merged"
 INPUTS=()
 
 usage() {
-    echo "Usage: $0 -o <output_dir> [-k keys.dat] <nsp-or-dir> ..." >&2
+    echo "Usage: $0 [-o <output_dir>] [-k keys.dat] [<nsp-or-dir> ...]" >&2
     exit 1
 }
 
@@ -46,7 +50,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ "${#INPUTS[@]}" -gt 0 ] || usage
+# With no positional inputs at all, default to scanning the directory this
+# script itself lives in - so `./switch-merge.sh` with no args just works
+# regardless of the caller's cwd, matching how ./bin is resolved above.
+[ "${#INPUTS[@]}" -gt 0 ] || INPUTS=("$SCRIPT_DIR")
 [ -f "$KEYS" ] || { echo "Keys file not found: $KEYS" >&2; exit 1; }
 command -v nstool >/dev/null || { echo "nstool not found in PATH" >&2; exit 1; }
 command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }

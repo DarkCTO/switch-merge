@@ -42,13 +42,17 @@ cd hactool && git apply /path/to/bin/patches/hactool-1.4.0-bktr-layout-fix.patch
 ## Usage
 
 ```
-./switch-merge.sh -o <output_dir> [-k keys.dat] <nsp-or-dir> ...
+./switch-merge.sh [-o <output_dir>] [-k keys.dat] [<nsp-or-dir> ...]
 ```
 
-- `-o` output directory (required)
+- `-o` output directory (defaults to `merged/` next to the script itself)
 - `-k` path to keys file (defaults to `~/.switch/prod.keys`)
 - every other argument is either an individual `.nsp` file or a directory
-  (non-recursively globbed for `*.nsp` files inside it), in any order
+  (non-recursively globbed for `*.nsp` files inside it), in any order —
+  with **no** positional inputs at all, defaults to scanning the directory
+  the script itself lives in (not your current working directory), so
+  `./switch-merge.sh` with zero arguments just works: drop your base/
+  update/DLC files next to the script and run it.
 
 **No `-b`/`-u`/per-DLC flags at all.** Base, update, and DLC are
 auto-detected by reading each input NSP's own cnmt content-meta `Type`
@@ -65,6 +69,13 @@ output NSP in one run. There's no need to separate games into subfolders
 first. Each title group is merged independently: if one group fails (a
 corrupt file, a missing base, etc.), the others still complete, and a
 summary at the end reports which titles succeeded and which failed and why.
+
+Example, no arguments at all — scans the script's own directory and writes
+to `merged/` next to it:
+
+```
+./switch-merge.sh
+```
 
 Example, point it at a folder containing base + update + any number of DLC
 for a single game:
@@ -640,6 +651,11 @@ above.
       automatically. No system package install required; also the only way
       to get the Bug #3 `hactool` fix applied without patching a system
       package.
+- [x] Zero-argument default — implemented: with no positional inputs,
+      scans the directory the script itself lives in (not the caller's
+      cwd) and defaults `-o` to `merged/` next to it, so dropping files
+      alongside the script and running `./switch-merge.sh` with no
+      arguments just works.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**

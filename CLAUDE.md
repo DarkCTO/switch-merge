@@ -25,10 +25,12 @@ live in this directory:
 - `Well Dweller [0100217023F6C000][B/U].nsp`
 
 Usage is fully auto-detecting — no `-b`/`-u`/per-DLC flags, and handles
-multiple different games in one run:
+multiple different games in one run. With zero arguments it defaults to
+scanning the directory the script itself lives in and writing to
+`merged/` next to it:
 
 ```
-./switch-merge.sh -o ./merged .
+./switch-merge.sh
 ```
 
 Every `.nsp` found (individual files or globbed one level deep from a
