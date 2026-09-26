@@ -106,6 +106,56 @@ xts_decrypt_sector() {
     echo "$plaintext"
 }
 
+# xts_encrypt_sector <key1_hex_32chars> <key2_hex_32chars> <sector_index> <plaintext_hex_512bytes>
+# Encrypts one 0x200-byte AES-XTS sector - the exact mirror of
+# xts_decrypt_sector above (XTS's "encrypt-then-XOR-twice" pattern just
+# swaps which side of the block cipher is -e vs -d; the tweak derivation
+# itself is identical either direction, still built via aes_ecb_hex -e
+# since the tweak is always ENCRYPTED with key2 regardless of which
+# direction the actual 16-byte data blocks go). Used by nca_build.sh to
+# write a Meta/Program NCA's own header - this project's own
+# xts_decrypt_sector already reads every NCA header this project has
+# ever needed to read, so encrypting one back is exactly this function
+# with -e/-d swapped on the data step. Echoes the ciphertext hex.
+xts_encrypt_sector() {
+    local key1="$1" key2="$2" sector_index="$3" pt="$4"
+    local sector_be
+    sector_be="$(printf '%032x' "$sector_index")"
+    local tweak
+    tweak="$(aes_ecb_hex -e "$key2" "$sector_be")"
+    local ciphertext="" i block xored encrypted
+    for (( i = 0; i < ${#pt}; i += 32 )); do
+        block="${pt:i:32}"
+        xored="$(xor_hex "$block" "$tweak")"
+        encrypted="$(aes_ecb_hex -e "$key1" "$xored")"
+        ciphertext+="$(xor_hex "$encrypted" "$tweak")"
+        tweak="$(gf128_double "$tweak")"
+    done
+    echo "$ciphertext"
+}
+
+# nca_encrypt_header <header_hex_0xC00bytes> <keys_file>
+# Encrypts a complete, freshly-assembled 0xC00-byte NCA header (6 XTS
+# sectors of 0x200 bytes each) with the same fixed header_key every real
+# NCA uses - the exact mirror of nca_header_field's per-sector decrypt,
+# just run over the whole header at once since a fresh build needs every
+# sector encrypted, not one field read from one sector. Echoes the full
+# 0xC00-byte ciphertext hex.
+nca_encrypt_header() {
+    local header_hex="$1" keys_file="$2"
+    local header_key
+    header_key="$(grep -m1 -oP '^header_key\s*=\s*\K[0-9a-fA-F]+' "$keys_file" | tr -d '\n' | cut -c1-64)"
+    [ "${#header_key}" -eq 64 ] || { echo "nca_encrypt_header: header_key not found or wrong length in $keys_file" >&2; return 1; }
+    local key1="${header_key:0:32}" key2="${header_key:32:32}"
+
+    local out="" sector sector_hex
+    for (( sector = 0; sector < 6; sector++ )); do
+        sector_hex="${header_hex:$((sector * 1024)):1024}"
+        out+="$(xts_encrypt_sector "$key1" "$key2" "$sector" "$sector_hex")"
+    done
+    echo "$out"
+}
+
 # nca_header_field <path to .nca file> <keys file> <byte_offset> <byte_size>
 # Reads and decrypts just enough of the NCA header to return one field's
 # raw hex bytes. Only decrypts the single 0x200-byte sector containing the

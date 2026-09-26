@@ -72,6 +72,8 @@ source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
 source "$SCRIPT_DIR/lib/romfs.sh"
 source "$SCRIPT_DIR/lib/bktr.sh"
+source "$SCRIPT_DIR/lib/romfs_build.sh"
+source "$SCRIPT_DIR/lib/nca_build.sh"
 
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
@@ -176,7 +178,6 @@ done
 # regardless of the caller's cwd, matching how ./bin is resolved above.
 [ "${#INPUTS[@]}" -gt 0 ] || INPUTS=("$SCRIPT_DIR")
 [ -f "$KEYS" ] || { echo "Keys file not found: $KEYS" >&2; exit 1; }
-command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }
 command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl not found in PATH (needed by lib/nca_header.sh)" >&2; exit 1; }
 
@@ -478,24 +479,37 @@ merge_group() {
         local EXEFS_PFS0="$GROUP_WORK/exefs_pfs0.bin"
         tail -c +$((exefs_data_off + 1)) "$EXEFS_SECTION_BIN" | head -c "$exefs_data_size" > "$EXEFS_PFS0"
         rm -f "$EXEFS_SECTION_BIN"
+
+        # Keep the exefs' own original container order (lib/pfs0.sh's
+        # _pfs0_read_entries) rather than extracting to a directory and
+        # re-scanning it - filesystem readdir() order isn't guaranteed to
+        # reproduce the original PFS0 order, and lib/nca_build.sh's
+        # nca_build_program needs the real order explicitly (see that
+        # function's own comment for why). Specifically the REVERSE of
+        # the PFS0 entry table's own order - confirmed by directly
+        # comparing against nstool -x's own on-disk write order for the
+        # same real file (nstool -x writes files in the reverse of their
+        # PFS0 table order, an nstool-internal quirk, not anything
+        # meaningful about the format itself - but this project's own
+        # prior verified reference outputs were all built via nstool -x
+        # extraction, so matching that exact order is what byte-for-byte
+        # continuity with those references actually requires).
         pfs0_extract_all "$EXEFS_PFS0" "$RECON_EXEFS"
+        local EXEFS_FILES=()
+        local exefs_name exefs_off exefs_size
+        while read -r exefs_name exefs_off exefs_size; do
+            EXEFS_FILES=("$RECON_EXEFS/$exefs_name" "${EXEFS_FILES[@]}")
+        done < <(_pfs0_read_entries "$EXEFS_PFS0")
         rm -f "$EXEFS_PFS0"
 
         echo "==> [$title_id] Rebuilding standalone (non-titlekey) Program NCA from reconstructed content"
-        local PROGRAM_BUILD_DIR="$GROUP_WORK/program_build"
-        mkdir -p "$PROGRAM_BUILD_DIR"
-        hacpack -k "$KEYS" \
-            --type nca --ncatype program --plaintext \
-            --exefsdir "$RECON_EXEFS" \
-            --romfsdir "$RECON_ROMFS" \
-            --titleid "$BASE_TITLE_ID" \
-            -o "$PROGRAM_BUILD_DIR" >/dev/null
+        local REBUILT_PROGRAM_NCA="$GROUP_WORK/rebuilt_program.nca"
+        nca_build_program "$REBUILT_PROGRAM_NCA" "$KEYS" "$BASE_TITLE_ID" EXEFS_FILES "$RECON_ROMFS" || exit 1
 
-        local REBUILT_PROGRAM_NCA
-        REBUILT_PROGRAM_NCA="$(find "$PROGRAM_BUILD_DIR" -maxdepth 1 -name '*.nca' | head -n1)"
-        [ -n "$REBUILT_PROGRAM_NCA" ] || { echo "[$title_id] Program NCA rebuild did not produce output" >&2; exit 1; }
-        cp "$REBUILT_PROGRAM_NCA" "$MERGE_DIR/"
-        PROGRAM_PATH="$MERGE_DIR/$(basename "$REBUILT_PROGRAM_NCA")"
+        local REBUILT_PROGRAM_ID
+        REBUILT_PROGRAM_ID="$(_nca_build_content_id_from_nca "$REBUILT_PROGRAM_NCA")"
+        cp "$REBUILT_PROGRAM_NCA" "$MERGE_DIR/${REBUILT_PROGRAM_ID}.nca"
+        PROGRAM_PATH="$MERGE_DIR/${REBUILT_PROGRAM_ID}.nca"
     else
         copy_nca_from "$PRIMARY_DIR" "$PROGRAM_NCA"
         PROGRAM_PATH="$MERGE_DIR/${PROGRAM_NCA}.nca"
@@ -511,36 +525,23 @@ merge_group() {
         done
     fi
 
-    local HACPACK_META_ARGS=(--programnca "$PROGRAM_PATH")
-
+    local CONTROL_NCA_PATH="" LEGAL_NCA_PATH=""
     if [ -n "$CONTROL_NCA" ]; then
         copy_nca_from "$PRIMARY_DIR" "$CONTROL_NCA"
-        HACPACK_META_ARGS+=(--controlnca "$MERGE_DIR/${CONTROL_NCA}.nca")
+        CONTROL_NCA_PATH="$MERGE_DIR/${CONTROL_NCA}.nca"
     fi
     if [ -n "$LEGAL_NCA" ]; then
         copy_nca_from "$PRIMARY_DIR" "$LEGAL_NCA"
-        HACPACK_META_ARGS+=(--legalnca "$MERGE_DIR/${LEGAL_NCA}.nca")
+        LEGAL_NCA_PATH="$MERGE_DIR/${LEGAL_NCA}.nca"
     fi
 
     echo "==> [$title_id] Building merged Meta NCA (application, base title id)"
-    # hacpack leaves the cnmt's trailing 32-byte digest as all-zero unless
-    # --digest is passed explicitly. The digest covers the cnmt's own
-    # bytes, which aren't known ahead of a build, so build once with a
+    # The cnmt's trailing 32-byte digest covers the cnmt's own bytes,
+    # which aren't known ahead of a build, so build once with a
     # placeholder digest, hash the resulting cnmt body, then rebuild
     # passing the real digest. See README's "The debugging story".
-    local META_BUILD_DIR="$GROUP_WORK/meta_build"
-    mkdir -p "$META_BUILD_DIR"
-    hacpack -k "$KEYS" \
-        --type nca --ncatype meta \
-        --titletype application \
-        --titleid "$BASE_TITLE_ID" \
-        --titleversion "$VERSION_HEX" \
-        "${HACPACK_META_ARGS[@]}" \
-        -o "$META_BUILD_DIR" >/dev/null
-
-    local DRAFT_META_NCA
-    DRAFT_META_NCA="$(find "$META_BUILD_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
-    [ -n "$DRAFT_META_NCA" ] || { echo "[$title_id] Meta NCA build did not produce output" >&2; exit 1; }
+    local DRAFT_META_NCA="$GROUP_WORK/draft_meta.nca"
+    nca_build_meta "$DRAFT_META_NCA" "$KEYS" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "" || exit 1
 
     local DRAFT_CNMT_FILE="$GROUP_WORK/draft.cnmt"
     extract_cnmt_from_meta_nca "$DRAFT_META_NCA" "$DRAFT_CNMT_FILE" || exit 1
@@ -550,14 +551,11 @@ merge_group() {
     CNMT_SIZE="$(stat -c%s "$DRAFT_CNMT_FILE")"
     DIGEST="$(head -c "$((CNMT_SIZE - 32))" "$DRAFT_CNMT_FILE" | sha256sum | cut -d' ' -f1)"
 
-    hacpack -k "$KEYS" \
-        --type nca --ncatype meta \
-        --titletype application \
-        --titleid "$BASE_TITLE_ID" \
-        --titleversion "$VERSION_HEX" \
-        "${HACPACK_META_ARGS[@]}" \
-        --digest "$DIGEST" \
-        -o "$MERGE_DIR" >/dev/null
+    local FINAL_META_NCA="$GROUP_WORK/final_meta.nca"
+    nca_build_meta "$FINAL_META_NCA" "$KEYS" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "$DIGEST" || exit 1
+    local FINAL_META_ID
+    FINAL_META_ID="$(_nca_build_content_id_from_nca "$FINAL_META_NCA")"
+    cp "$FINAL_META_NCA" "$MERGE_DIR/${FINAL_META_ID}.cnmt.nca"
 
     # DLC titles install as separate sibling titles (type AddOnContent)
     # that merely reference the base ApplicationId - unlike the update,

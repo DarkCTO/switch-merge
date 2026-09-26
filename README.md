@@ -2,10 +2,10 @@
 
 Merges a Nintendo Switch base-game NSP with (optionally) its update NSP
 and (optionally) any number of DLC NSPs into a single installable NSP,
-natively on Linux via bash + `hacpack` (`nstool`/`hactool` are vendored
-too but no longer a runtime dependency — see "Reduce dependency on
-vendored tools" in the roadmap below). Built as a CLI-native replacement
-for
+natively on Linux, entirely in bash (`nstool`/`hacpack`/`hactool` are
+vendored in `bin/` but none of them are a runtime dependency anymore —
+see "Reduce dependency on vendored tools" in the roadmap below). Built as
+a CLI-native replacement for
 [NSC_Builder](https://github.com/julesontheroad/NSC_BUILDER), which is
 Windows-first and currently archived.
 
@@ -30,17 +30,19 @@ document assumes it. If you just want to use the tool, skip to "Usage".
 - Your console's `prod.keys` at `~/.switch/prod.keys` (standard Lockpick_RCM
   output location).
 
-**No package install needed.** `hacpack` (the one tool the pipeline
-actually still calls — `nstool`/`hactool` are vendored alongside it too,
-purely for optional manual debugging/cross-verification) is vendored
-directly in `bin/` — `switch-merge.sh` puts that directory first on
-`PATH` automatically, so the project is self-contained and doesn't depend
-on whatever version (if any) happens to be installed system-wide.
-`bin/hactool` specifically still carries a local fix for two real bugs in
-upstream 1.4.0 (the latest release, and still present at time of writing)
-that reject some legitimate update NCAs — see "The debugging story" below
-and `bin/patches/hactool-1.4.0-bktr-layout-fix.patch` for the exact change
-and why it's needed, even though the pipeline itself now has its own,
+**No package install needed, and no vendored binary is actually required
+to run a merge anymore.** `nstool`/`hacpack`/`hactool` are still vendored
+in `bin/` (which `switch-merge.sh` puts first on `PATH` automatically,
+for whenever they're wanted) purely as optional manual-debugging/
+cross-verification tools — every one of them was confirmed unused by the
+real merge pipeline via the same test: temporarily replace the vendored
+binary with a wrapper that fails loudly if invoked, then run a full
+merge and confirm the wrapper never fires. `bin/hactool` specifically
+still carries a local fix for two real bugs in upstream 1.4.0 (the latest
+release, and still present at time of writing) that reject some
+legitimate update NCAs — see "The debugging story" below and
+`bin/patches/hactool-1.4.0-bktr-layout-fix.patch` for the exact change and
+why it's needed, even though the pipeline itself now has its own,
 separate from-scratch BKTR reader (`lib/bktr.sh`) that doesn't share that
 bug at all. If you ever want to rebuild these from source instead of
 trusting the vendored binaries:
@@ -756,7 +758,7 @@ above.
 |---|---|
 | NSC_Builder | Does the real job, but Windows-first, archived, GUI-oriented. The reason this project exists. |
 | `nsz` | Compress/decompress only (NSP↔NSZ, XCI↔XCZ). Not a content merger. |
-| `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta`/`--ncatype program` + `--ncadir` modes are exactly what's needed for building NCAs — see above. Its flat `--type nsp` container-packing role has since been replaced by this project's own `lib/pfs0.sh` (no crypto/hashing involved in that format, low risk to reimplement — see "The debugging story"), but `hacpack` is still used for the actual NCA-building steps (Meta, Program), which do involve encryption/hash-tree construction. |
+| `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta`/`--ncatype program` + `--ncadir` modes are exactly what's needed for building NCAs. **No longer used by the merge pipeline at all** — its flat `--type nsp` container-packing role was replaced early on by this project's own `lib/pfs0.sh` (no crypto/hashing involved, low risk — see "The debugging story"), and its NCA-building role (Meta, Program — real hash-tree construction, once assumed to be the one piece not worth reimplementing) turned out to need no cryptographic primitive beyond what this project already had for reading; see `lib/nca_build.sh`/`lib/romfs_build.sh` and the roadmap's final ("eighth piece") entry for the full derivation, defaults reproduced, and byte-for-byte verification. Confirmed truly unused via the same wrapper-substitution test as `nstool`/`hactool`. Still vendored in `bin/` for manual debugging/cross-verification only. |
 | `nstool` | **No longer used by the merge pipeline at all.** Every call site it used to have — cnmt/NACP field reading, NCA-header `RightsId` reading, ticket (`.tik`) titlekey reading, per-title content-key derivation + AES-CTR content decryption, NSP/NCA(PartitionFs) container splitting, and Control NCA `control.nacp` extraction (RomFs/`HierarchicalIntegrity`) — is now pure bash; see `lib/binfmt.sh`/`lib/nca_header.sh`/`lib/nca_content.sh`/`lib/pfs0.sh`/`lib/romfs.sh` and `switch-merge.sh`'s `extract_nsp`/`extract_cnmt_from_meta_nca`/`extract_nacp_from_control_nca`. Confirmed truly unused (not just untested) by temporarily replacing the vendored `bin/nstool` with a wrapper that fails loudly if invoked and re-running a full 1G1R batch merge end-to-end — it never fired. Still vendored in `bin/` for manual debugging, just no longer a runtime dependency. |
 | `hactool` | **Also no longer used by the merge pipeline.** Was chosen for BKTR delta reconstruction (`--basenca` against a plaintext-decrypted base Program NCA) and decrypting a titlekey-crypto NCA to plaintext (`--plaintext=<file>`) as a prerequisite for that — see "The debugging story" for the original investigation, and "Reduce dependency on vendored tools" roadmap's final entry for how this project's own `lib/bktr.sh` replaced both, derived directly from this exact vendored `hactool` 1.4.0 build's own C source (the BKTR relocation/subsection bucket-tree format isn't documented anywhere else). Confirmed truly unused the same way as `nstool` above (wrapper substitution, full batch merge, no invocation), and confirmed correct by diffing (`diff -rq`) the pure-bash reconstruction's full output directory tree against `hactool --basenca`'s own reconstruction, byte-for-byte, on both this project's real BKTR update titles (including the harder of the two, which needed splitting reads at subsection boundaries mid-reconstruction). Upstream 1.4.0 has a real, confirmed BKTR layout-validation bug (Bug #3) — this project's own from-scratch reader doesn't implement that overly-strict check at all, consistent with Bug #3's own finding that it's unnecessary. Still vendored in `bin/` (a locally-patched build, not the stock release) for manual debugging/cross-verification, just no longer a runtime dependency. |
 | `DarkMatterCore/nxdumptool` | Not used as a dependency, but its source was consulted directly to confirm hactool's BKTR checks are unnecessary (see Bug #3) — it successfully reads BKTR patch romfs with no equivalent pre-validation at all. |
@@ -1114,6 +1116,134 @@ above.
       loudly on a wrong read, like a bad magic/wrong key producing garbage
       instead of valid content, or was checked byte-for-byte against a
       known-good reference before ever running unsupervised).
+- [x] Reduce dependency on vendored tools, eighth (final) piece —
+      **`hacpack` eliminated too — zero vendored-tool runtime dependencies
+      remain.** The "higher-risk tier" reasoning above turned out to
+      still be worth pursuing once actually attempted: every field and
+      cryptographic step `hacpack` 1.36_r2 needs (source read directly,
+      the same vendored version this project already used as read-side
+      ground truth) turned out to need no primitive beyond what this
+      project already had — AES-128-ECB (encrypt direction, for the key
+      area), AES-128-CTR (content, the SAME primitive read or write,
+      confirmed by an encrypt-then-decrypt round-trip test before relying
+      on this), AES-128-XTS (encrypt direction, for the header — added
+      `xts_encrypt_sector`/`nca_encrypt_header` to `lib/nca_header.sh`,
+      the exact mirror of its own existing decrypt functions), and SHA256
+      (not a decrypt/encrypt operation at all). New `lib/nca_build.sh`
+      adds `nca_build_cnmt`/`nca_build_meta` (replacing both
+      `hacpack --ncatype meta` calls, including the existing two-pass
+      digest fix, now operating on this project's own output instead of
+      hacpack's) and `nca_build_program` (replacing
+      `hacpack --ncatype program --plaintext`), plus
+      `_nca_build_content_id_from_nca` (the content-ID-from-SHA256
+      filename convention every NCA on disk already uses, confirmed
+      directly from hacpack's own `nca_create_meta`/`nca_create_program`:
+      `hexBinaryString(nca_hash, 16, ...)`).
+
+      Two deliberate, confirmed-safe defaults this project's own builder
+      reproduces rather than reinvents (hacpack's own unset/default
+      values, since `switch-merge.sh` never passed the flags that would
+      change them): `--ncasig` defaults to all-zero `fixed_key_sig`/
+      `npdm_key_sig` (no RSA signing at all — this project's CFW-target
+      use case doesn't need real Nintendo/eShop signatures, confirmed
+      against a real hacpack-built NCA in this project's own prior merged
+      output: both fields were already all-zero before this change too);
+      `--keyareakey` defaults to `0x04` repeated 16 times as the
+      PLAINTEXT content key later wrapped into the header's key area
+      (an arbitrary placeholder, not derived from `prod.keys` at all —
+      only the WRAPPING uses real per-console key material, confirmed the
+      same way).
+
+      The Program NCA side needed a second, separate reimplementation:
+      **`lib/romfs_build.sh`**, a full pure-bash port of hacpack's own
+      `romfs_build` (romfs.c) — recursive directory-tree walk (sorted by
+      plain byte comparison, `LC_ALL=C`, matching C's `strcmp` exactly,
+      NOT filesystem/readdir order), a custom path-hash function
+      (`calc_path_hash` — parent XOR a fixed constant, then per-byte
+      32-bit rotate+XOR, verified bit-for-bit against a real file's own
+      hash-table bucket assignment before trusting it further), and an
+      odd-count hash-table sizing rule (`romfs_get_hash_table_count`,
+      avoiding small prime factors 2/3/5/7/11/13/17 — NOT simply the
+      entry count) — none of this is documented anywhere online in
+      operational detail; switchbrew's wiki covers the on-disk entry
+      struct layout (already used by this project's own read-side
+      `lib/romfs.sh`) but not how a valid instance of that layout gets
+      constructed from a directory tree in the first place. This turned
+      out to be necessary the hard way: the initial plan was to skip
+      rebuilding the romfs container at all and just IVFC-hash this
+      project's own already-BKTR-reconstructed romfs bytes directly
+      (content-correct, already verified file-for-file against
+      `hactool`'s own reconstruction) — that produced a functionally
+      correct but NOT byte-identical result, because `hacpack`'s own
+      `romfs_build` independently re-derives the entire directory/file
+      table AND file-data-partition layout from its own directory walk,
+      and a real Nintendo-built romfs's on-disk file order doesn't have
+      to match hacpack's own alphabetical rebuild order (confirmed by
+      directly extracting hacpack's own intermediate pre-hash romfs file
+      — hard-linking it out from under hacpack's own temp-directory
+      cleanup before it could delete it — and finding the file-partition
+      layout differed by thousands of bytes despite identical file
+      content).
+
+      Two more real, confirmed bugs found and fixed while wiring
+      everything together, both caught by byte-for-byte comparison
+      against real hacpack-built files, not guessed:
+      - `romfs_build`'s own outer wrapper (not the inner table-building
+        function) pads its ENTIRE final output to a 0x4000
+        (`IVFC_HASH_BLOCK_SIZE`) boundary, and separately, the IVFC
+        level-5 header field (`hash_data_size`/`logical_offset` for the
+        raw romfs data itself) records the UNPADDED size from before that
+        final step — captured in hacpack's own source at the exact moment
+        `*out_size = ftello64(f_out)` runs, which is BEFORE the padding
+        `fwrite` that follows it. Getting this backwards (using the
+        padded on-disk file size for the header field, or the unpadded
+        size for the actual byte count written) produces a same-size,
+        differently-CONTENTED file — caught by comparing IVFC level
+        headers field-by-field against a real file's own decrypted
+        header, not just comparing total file sizes.
+      - The literal ASCII bytes for the `"IVFC"` magic were written
+        backwards in one spot (`46435649` instead of `49564643`) - a
+        plain typo, caught the same way (a field-by-field header diff
+        against a real file), not something a size-only check would ever
+        catch.
+
+      Also confirmed, while wiring the Program NCA path into
+      `switch-merge.sh`'s real merge pipeline (not just a standalone
+      test): `nstool -x`'s own on-disk file-write order for a PartitionFs
+      section is the REVERSE of that section's own entry-table order —
+      an `nstool`-internal quirk, not anything meaningful about the PFS0
+      format itself (this project's own `_pfs0_read_entries` already
+      reads the entry table's own true, forward order correctly) — but
+      since every one of this project's prior verified reference outputs
+      was originally built via `nstool -x` extraction feeding hacpack's
+      own `--exefsdir`, matching that exact (reversed) order turned out
+      to be necessary for byte-for-byte continuity with those existing
+      references, confirmed by directly comparing `nstool -x`'s own raw
+      directory-creation order (`ls -f`) against the reference NSP's own
+      exefs entry table.
+
+      Verified end-to-end at every level: `nca_build_meta` and
+      `nca_build_cnmt` produce byte-for-byte identical output (`cmp`) to
+      a real `hacpack --ncatype meta` build for the same inputs, including
+      the derived content-ID filename; `romfs_build` produces a
+      byte-for-byte identical (`cmp`) raw romfs container to hacpack's own
+      intermediate pre-hash file (hard-linked out from its temp directory
+      before cleanup); `nca_build_program` produces a byte-for-byte
+      identical Program NCA to this project's own previously-verified,
+      hardware-tested merge output; and the FULL 1G1R batch merge (both
+      real test titles, Dicefolk base+update+DLC and Well Dweller
+      base+update) was re-run end-to-end through the actual
+      `switch-merge.sh` pipeline with every vendored tool's binary
+      simultaneously replaced by a wrapper that fails loudly if invoked
+      (`nstool`, `hactool`, AND `hacpack` all at once) — producing output
+      NSPs byte-for-byte identical to the original, hardware-tested
+      references, with zero invocations of any wrapper. **The project
+      now depends on nothing beyond bash, `xxd`, `openssl`, and coreutils
+      (`sha256sum`, `split`, `dd`, etc.) already listed in "Requirements"
+      above** — `nstool`/`hacpack`/`hactool` remain vendored in `bin/`
+      purely for optional manual debugging/cross-verification (their
+      human-readable dumps and reference output are how every piece above
+      was built and checked), not because the pipeline needs them.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**
