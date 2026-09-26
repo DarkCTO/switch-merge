@@ -18,12 +18,12 @@
  */
 #include "common.h"
 #include "crypto.h"
+#include "nca_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define NCA_HEADER_SIZE 0xC00
 #define SECTOR_SIZE 0x200
 
 /* gf128_double_be <tweak[16]> - doubles a 16-byte tweak in GF(2^128),
@@ -74,10 +74,7 @@ static int xts_crypt_sector(int encrypt, const unsigned char key1[16], const uns
     return 0;
 }
 
-/* nca_decrypt_header <nca_path> <keys_path> <out[NCA_HEADER_SIZE]>
- * Decrypts the full 0xC00-byte header (6 XTS sectors) into out. Returns
- * 0 on success, nonzero (with a message on stderr) on failure. */
-static int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned char *out) {
+int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned char *out) {
     char *header_key_hex = keys_file_lookup(keys_path, "header_key", 64);
     if (!header_key_hex) {
         fprintf(stderr, "header_key not found or wrong length in %s\n", keys_path);

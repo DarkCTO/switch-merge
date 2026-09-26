@@ -297,43 +297,62 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
 1. Re-read `README.md` in full — it has the authoritative, kept-current
    pipeline description, known issues, and roadmap.
 0. **`smtool` (C port of the perf-critical pipeline) is IN PROGRESS,
-   Phases 1-2 of 9 landed.** See README roadmap's `smtool` entries for
+   Phases 1-5 of 9 landed.** See README roadmap's `smtool` entries for
    full detail. Short version: the bash pipeline is measured ~100x
    slower than the vendored C tools on equivalent work, so a new
    `src/smtool/` C project (links libcrypto) reimplements it as one-shot
    subcommands (`bin/smtool <subcommand> ...`), called by default from
-   `switch-merge.sh`; `--pure` routes back to the original bash. Landed
-   so far: pure struct/container parsing (cnmt/NACP/ticket/PFS0/HFS0
-   reading, Phase 1) and NCA header AES-XTS decryption + RightsId reading
-   (Phase 2, `src/smtool/nca_header.c` + `crypto.c`'s libcrypto-backed
-   AES-128-ECB primitive). Verified byte-for-byte against bash output on
-   every fixture in `tests/` (`bash tests/run.sh`) AND against full real
-   1G1R merges, both titlekey-crypto and standard-crypto inputs (compiled
-   vs `--pure`, `cmp`-identical output every time). **Honest finding from
-   Phase 1, still true**: real-world merge speedup so far is small — the
-   dominant real-file cost (copying a multi-GB secure partition to
-   scratch) is I/O-bound either way, not sped up by faster parsing. The
-   big win is still expected from later phases (streaming AES-CTR content
-   decryption specifically, Phase 5 - replacing per-section `openssl`
-   subprocess spawns with in-process crypto on the actual multi-GB
-   payload) — don't assume progress so far made the pipeline fast; 7 of 9
-   phases remain. Remaining phases, in order: NCA content-key derivation
-   (Phase 3), RomFs/BKTR readers (Phase 4), streaming AES-CTR content
-   decryption (Phase 5), RomFs writer (Phase 6), NCA builder Meta then
-   Program (Phases 7-8), final cutover (Phase 9 - `smtool` becomes
-   required, `--pure` finalized as the explicit slow-path opt-in). If the
-   user asks to continue this, don't re-derive the design from scratch —
-   the phase ordering, subcommand-naming convention (`<noun>-<verb>`,
-   `KEY=VALUE` multi-field output), and `op_*`/`--pure` dispatch pattern
-   are already decided; follow the existing shape in `switch-merge.sh`
-   (`op_parse_cnmt`, `op_nca_rights_id`, etc.) and `src/smtool/` (one `.c`
-   file per module, `main.c` dispatches by subcommand name) for the next
-   phase rather than inventing a new one. One real design decision Phase
-   2 made that later phases should keep following: `nca-header-decrypt`
-   decrypts the WHOLE 0xC00-byte header in one call rather than mirroring
-   bash's per-field `nca_header_field` - later C code reads whatever
-   offset it needs directly from the decrypted buffer in-process, it
-   doesn't spawn another subcommand per field the way bash had to.
+   `switch-merge.sh`; `--pure` routes back to the original bash. Landed:
+   pure struct/container parsing (Phase 1: cnmt/NACP/ticket/PFS0/HFS0),
+   NCA header AES-XTS decrypt + RightsId (Phase 2: `nca_header.c` +
+   `crypto.c`'s libcrypto AES-128-ECB primitive), NCA content-key
+   derivation (Phase 3: `nca_content.c` - `nca-crypto-type`,
+   `nca-content-key-standard`, `nca-content-key-titlekey`,
+   `nca-section-info`), RomFs reader + BKTR bucket-tree PARSING only,
+   not full reconstruction (Phase 4: `romfs.c`, `bktr.c`), and streaming
+   AES-128-CTR content decryption + hash-layer offset resolution (Phase
+   5: `nca_decrypt.c` - **this is the phase that delivers the real
+   speedup**). Verified byte-for-byte against bash output on every
+   fixture in `tests/` (`bash tests/run.sh`, 20 passing) AND against full
+   real 1G1R merges, both titlekey-crypto and standard-crypto inputs
+   (compiled vs `--pure`, `cmp`-identical output every time).
+
+   **The Phase 1 "honest finding" is now resolved, not just superseded**:
+   Phase 5's `decrypt-section` replaced per-section `openssl` subprocess
+   spawns with in-process libcrypto EVP streaming, and the measured
+   real-file speedup is now large and confirmed: **10.5s (compiled) vs
+   43.3s (`--pure`)** for the same real XCI merge, ~4x. Don't re-measure
+   this from scratch if picking the work back up — it's already
+   confirmed working and fast for the phases that landed.
+
+   Remaining phases, in order: RomFs writer (Phase 6), NCA builder Meta
+   then Program (Phases 7-8), final cutover (Phase 9 - `smtool` becomes
+   required, `--pure` finalized as the explicit slow-path opt-in). Also
+   still open within what's already landed: full BKTR *reconstruction*
+   (`bktr_reconstruct` itself, as opposed to the bucket-tree parsing
+   Phase 4 already ported) has NOT been ported to C yet - no real
+   update/BKTR-delta sample file was available this session to verify a
+   C port of the reconstruction loop against (every real update-NSP
+   pattern this project has tested requires a base+update PAIR, and only
+   base-only samples were on hand) - this remains bash-only and should be
+   revisited if a real update sample becomes available, independent of
+   the Phase 6-9 NCA-building work.
+
+   If the user asks to continue this, don't re-derive the design from
+   scratch — the phase ordering, subcommand-naming convention
+   (`<noun>-<verb>`, `KEY=VALUE` multi-field output), and `op_*`/`--pure`
+   dispatch pattern are already decided; follow the existing shape in
+   `switch-merge.sh` (`op_parse_cnmt`, `op_nca_rights_id`,
+   `op_nca_ctr_decrypt_section`, etc.) and `src/smtool/` (one `.c` file
+   per module, `main.c` dispatches by subcommand name, `nca_common.h`
+   shares the header-decrypt primitive across files) for the next phase
+   rather than inventing a new one. One real design decision Phase 2 made
+   that later phases kept following: `nca-header-decrypt` decrypts the
+   WHOLE 0xC00-byte header in one call rather than mirroring bash's
+   per-field `nca_header_field` - later C code (Phase 3's key derivation,
+   Phase 4's `bktr-headers`, Phase 5's layer resolvers) all read whatever
+   offset they need directly from an already-decrypted header file/buffer
+   in-process, never spawning another subcommand per field.
 2. **Vendored-tool elimination is done.** `nstool`/`hacpack`/`hactool` are
    all confirmed unused by the merge pipeline (see README roadmap's
    "fourth" through "eighth piece" entries for the full history: cnmt/NACP

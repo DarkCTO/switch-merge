@@ -23,6 +23,18 @@ int cmd_hfs0_list(int argc, char **argv);
 int cmd_hfs0_extract_all(int argc, char **argv);
 int cmd_nca_header_decrypt(int argc, char **argv);
 int cmd_nca_rights_id(int argc, char **argv);
+int cmd_nca_crypto_type(int argc, char **argv);
+int cmd_nca_content_key_standard(int argc, char **argv);
+int cmd_nca_content_key_titlekey(int argc, char **argv);
+int cmd_nca_section_info(int argc, char **argv);
+int cmd_romfs_extract(int argc, char **argv);
+int cmd_romfs_extract_all(int argc, char **argv);
+int cmd_bktr_headers(int argc, char **argv);
+int cmd_bktr_relocations(int argc, char **argv);
+int cmd_bktr_subsections(int argc, char **argv);
+int cmd_nca_ctr_decrypt_section(int argc, char **argv);
+int cmd_nca_hierarchical_sha256_layer(int argc, char **argv);
+int cmd_nca_hierarchical_integrity_layer(int argc, char **argv);
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -39,7 +51,19 @@ int main(int argc, char **argv) {
             "  hfs0-list <path> <header_offset>\n"
             "  hfs0-extract-all <path> <header_offset> <out_dir>\n"
             "  nca-header-decrypt <nca_path> --keys <keys_file> -o <out_file>\n"
-            "  nca-rights-id <nca_path> --keys <keys_file>\n");
+            "  nca-rights-id <nca_path> --keys <keys_file>\n"
+            "  nca-crypto-type <nca_path> --keys <keys_file>\n"
+            "  nca-content-key-standard <nca_path> --keys <keys_file>\n"
+            "  nca-content-key-titlekey <titlekey_hex> <key_generation> --keys <keys_file>\n"
+            "  nca-section-info <nca_path> --keys <keys_file> --section <0-3>\n"
+            "  romfs-extract <romfs_file> <entry_name> <out_path>\n"
+            "  romfs-extract-all <romfs_file> <out_dir>\n"
+            "  bktr-headers <decrypted_header_file> --section <0-3>\n"
+            "  bktr-relocations <table_file>\n"
+            "  bktr-subsections <table_file>\n"
+            "  decrypt-section <nca_path> --key-hex <hex32> --ctr <hex32> --offset <N> --size <N> -o <out_path>\n"
+            "  nca-hierarchical-sha256-layer <decrypted_header_file> --section <0-3>\n"
+            "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n");
         return 1;
     }
 
@@ -58,6 +82,18 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "hfs0-extract-all") == 0) return cmd_hfs0_extract_all(sargc, sargv);
     if (strcmp(sub, "nca-header-decrypt") == 0) return cmd_nca_header_decrypt(sargc, sargv);
     if (strcmp(sub, "nca-rights-id") == 0) return cmd_nca_rights_id(sargc, sargv);
+    if (strcmp(sub, "nca-crypto-type") == 0) return cmd_nca_crypto_type(sargc, sargv);
+    if (strcmp(sub, "nca-content-key-standard") == 0) return cmd_nca_content_key_standard(sargc, sargv);
+    if (strcmp(sub, "nca-content-key-titlekey") == 0) return cmd_nca_content_key_titlekey(sargc, sargv);
+    if (strcmp(sub, "nca-section-info") == 0) return cmd_nca_section_info(sargc, sargv);
+    if (strcmp(sub, "romfs-extract") == 0) return cmd_romfs_extract(sargc, sargv);
+    if (strcmp(sub, "romfs-extract-all") == 0) return cmd_romfs_extract_all(sargc, sargv);
+    if (strcmp(sub, "bktr-headers") == 0) return cmd_bktr_headers(sargc, sargv);
+    if (strcmp(sub, "bktr-relocations") == 0) return cmd_bktr_relocations(sargc, sargv);
+    if (strcmp(sub, "bktr-subsections") == 0) return cmd_bktr_subsections(sargc, sargv);
+    if (strcmp(sub, "decrypt-section") == 0) return cmd_nca_ctr_decrypt_section(sargc, sargv);
+    if (strcmp(sub, "nca-hierarchical-sha256-layer") == 0) return cmd_nca_hierarchical_sha256_layer(sargc, sargv);
+    if (strcmp(sub, "nca-hierarchical-integrity-layer") == 0) return cmd_nca_hierarchical_integrity_layer(sargc, sargv);
 
     fprintf(stderr, "smtool: unknown subcommand '%s'\n", sub);
     return 1;

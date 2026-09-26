@@ -17,6 +17,9 @@ source "$SCRIPT_DIR/lib/binfmt.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
 source "$SCRIPT_DIR/lib/hfs0.sh"
 source "$SCRIPT_DIR/lib/nca_header.sh"
+source "$SCRIPT_DIR/lib/nca_content.sh"
+source "$SCRIPT_DIR/lib/romfs.sh"
+source "$SCRIPT_DIR/lib/bktr.sh"
 
 [ -x "$SMTOOL" ] || { echo "FAIL: $SMTOOL not found or not executable - build it first with 'make -C src/smtool'" >&2; exit 1; }
 
@@ -102,6 +105,139 @@ else
     echo "SKIP: xci_root.hfs0 fixture missing"
 fi
 
+# --- romfs-extract / romfs-extract-all: real Control NCA RomFs blob ---
+f="$FIXTURES/control.romfs"
+if [ -f "$f" ]; then
+    bash_extract="$(mktemp -d)"
+    smtool_extract="$(mktemp -d)"
+    romfs_extract "$f" control.nacp "$bash_extract/control.nacp"
+    "$SMTOOL" romfs-extract "$f" control.nacp "$smtool_extract/control.nacp"
+    if cmp -s "$bash_extract/control.nacp" "$smtool_extract/control.nacp"; then
+        echo "PASS: romfs-extract"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: romfs-extract"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -rf "$bash_extract" "$smtool_extract"
+
+    bash_extract_all="$(mktemp -d)"
+    smtool_extract_all="$(mktemp -d)"
+    romfs_extract_all "$f" "$bash_extract_all/out"
+    "$SMTOOL" romfs-extract-all "$f" "$smtool_extract_all/out"
+    if diff -rq "$bash_extract_all/out" "$smtool_extract_all/out" >/dev/null 2>&1; then
+        echo "PASS: romfs-extract-all"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: romfs-extract-all"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -rf "$bash_extract_all" "$smtool_extract_all"
+else
+    echo "SKIP: control.romfs fixture missing"
+fi
+
+# --- bktr-relocations / bktr-subsections: synthetic multi-bucket
+# fixtures - specifically exercise the fixed-0x4000-stride bug this
+# project already found and fixed once (an earlier wrong 0x4014/0x4010
+# "stride + overflow entry" guess read past the end of a real 29-bucket
+# table) - a single-bucket-only test could not catch a stride regression
+# at all, since bucket 1's start offset only matters when there IS one. ---
+for shape in reloc subsec; do
+    f="$FIXTURES/bktr_${shape}_2bucket.bin"
+    [ -f "$f" ] || { echo "SKIP: bktr_${shape}_2bucket.bin fixture missing"; continue; }
+    if [ "$shape" = "reloc" ]; then
+        bash_out="$(_bktr_parse_bucket0_relocations "$f")"
+        smtool_out="$("$SMTOOL" bktr-relocations "$f")"
+    else
+        bash_out="$(_bktr_parse_bucket0_subsections "$f")"
+        smtool_out="$("$SMTOOL" bktr-subsections "$f")"
+    fi
+    if [ "$bash_out" = "$smtool_out" ]; then
+        echo "PASS: bktr-${shape} (2-bucket)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: bktr-${shape} (2-bucket)"
+        echo "  bash:   $bash_out"
+        echo "  smtool: $smtool_out"
+        FAIL=$((FAIL + 1))
+    fi
+done
+
+# --- bktr-headers: synthetic decrypted-header fixture with a real BKTR
+# superblock at section 1 (and deliberately none at section 0, to also
+# confirm the bad-magic failure path fires) ---
+f="$FIXTURES/bktr_header_section1.bin"
+if [ -f "$f" ]; then
+    smtool_out="$("$SMTOOL" bktr-headers "$f" --section 1)"
+    expected="BKTR_RELOC_OFF=20480
+BKTR_RELOC_SIZE=32768
+BKTR_SUBSEC_OFF=53248
+BKTR_SUBSEC_SIZE=4096"
+    assert_kv_match "bktr-headers (section 1)" "$expected" "$smtool_out"
+
+    if "$SMTOOL" bktr-headers "$f" --section 0 >/dev/null 2>&1; then
+        echo "FAIL: bktr-headers (section 0, should fail on missing magic)"
+        FAIL=$((FAIL + 1))
+    else
+        echo "PASS: bktr-headers (section 0, correctly fails on missing magic)"
+        PASS=$((PASS + 1))
+    fi
+else
+    echo "SKIP: bktr_header_section1.bin fixture missing"
+fi
+
+# REAL_KEYS: a real prod.keys, which can't be committed (console-
+# specific, gitignored). Every test needing real crypto below checks for
+# it and skips automatically if absent - this is the "manual-only
+# verification" case tests/run.sh's own design accepted: CI/a clean
+# checkout with no keys still gets full coverage of every fixture that
+# doesn't need one.
+REAL_KEYS="$HOME/.switch/prod.keys"
+
+# --- decrypt-section / nca-hierarchical-*-layer ---
+if [ -f "$REAL_KEYS" ]; then
+    control_nca_full="$FIXTURES/control.nca"
+    if [ -f "$control_nca_full" ]; then
+        bash_key="$(nca_content_key_standard "$control_nca_full" "$REAL_KEYS")"
+        smtool_key="$("$SMTOOL" nca-content-key-standard "$control_nca_full" --keys "$REAL_KEYS")"
+        assert_kv_match "nca-content-key-standard" "KEY=$bash_key" "KEY=$smtool_key"
+
+        nca_section_info "$control_nca_full" "$REAL_KEYS" 0
+        bash_section_kv="NCA_SECTION_PRESENT=$NCA_SECTION_PRESENT
+NCA_SECTION_OFFSET=$NCA_SECTION_OFFSET
+NCA_SECTION_SIZE=$NCA_SECTION_SIZE
+NCA_SECTION_CRYPT_TYPE=$NCA_SECTION_CRYPT_TYPE
+NCA_SECTION_CTR=$NCA_SECTION_CTR"
+        smtool_section_kv="$("$SMTOOL" nca-section-info "$control_nca_full" --keys "$REAL_KEYS" --section 0)"
+        assert_kv_match "nca-section-info" "$bash_section_kv" "$smtool_section_kv"
+
+        bash_decrypt="$(mktemp)"
+        smtool_decrypt="$(mktemp)"
+        nca_ctr_decrypt_section "$control_nca_full" "$bash_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$bash_decrypt"
+        "$SMTOOL" decrypt-section "$control_nca_full" --key-hex "$smtool_key" --ctr "$NCA_SECTION_CTR" --offset "$NCA_SECTION_OFFSET" --size "$NCA_SECTION_SIZE" -o "$smtool_decrypt"
+        if cmp -s "$bash_decrypt" "$smtool_decrypt"; then
+            echo "PASS: decrypt-section"
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL: decrypt-section"
+            FAIL=$((FAIL + 1))
+        fi
+        rm -f "$bash_decrypt" "$smtool_decrypt"
+
+        bash_layer="$(nca_hierarchical_integrity_data_layer "$control_nca_full" "$REAL_KEYS" 0)"
+        hdr_tmp="$(mktemp)"
+        "$SMTOOL" nca-header-decrypt "$control_nca_full" --keys "$REAL_KEYS" -o "$hdr_tmp"
+        smtool_layer="$("$SMTOOL" nca-hierarchical-integrity-layer "$hdr_tmp" --section 0)"
+        rm -f "$hdr_tmp"
+        assert_kv_match "nca-hierarchical-integrity-layer" "LAYER=$bash_layer" "LAYER=$smtool_layer"
+    else
+        echo "SKIP: decrypt-section/nca-section-info tests (control.nca fixture missing)"
+    fi
+else
+    echo "SKIP: decrypt-section/nca-section-info tests (no $REAL_KEYS on this machine)"
+fi
+
 # --- nca-rights-id / nca-header-decrypt: both fixtures below already
 # exercise the big-endian-vs-little-endian sector-tweak distinction that
 # matters most here - RightsId lives at header offset 0x230, inside
@@ -119,7 +255,6 @@ fi
 # "manual-only verification" case tests/run.sh's own design accepted:
 # CI/a clean checkout with no keys still gets full coverage of every
 # fixture that doesn't need one.
-REAL_KEYS="$HOME/.switch/prod.keys"
 if [ -f "$REAL_KEYS" ]; then
     for shape in program_titlekey control_standard; do
         f="$FIXTURES/$shape.nca_header"

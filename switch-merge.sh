@@ -237,6 +237,113 @@ op_nca_rights_id() {
     fi
 }
 
+# op_nca_crypto_type <nca_path>
+op_nca_crypto_type() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_crypto_type "$1" "$KEYS"
+    else
+        "$SMTOOL" nca-crypto-type "$1" --keys "$KEYS"
+    fi
+}
+
+# op_nca_content_key_standard <nca_path>
+op_nca_content_key_standard() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_content_key_standard "$1" "$KEYS"
+    else
+        "$SMTOOL" nca-content-key-standard "$1" --keys "$KEYS"
+    fi
+}
+
+# op_nca_content_key_titlekey <titlekey_hex> <key_generation>
+op_nca_content_key_titlekey() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_content_key_titlekey "$1" "$2" "$KEYS"
+    else
+        "$SMTOOL" nca-content-key-titlekey "$1" "$2" --keys "$KEYS"
+    fi
+}
+
+# op_nca_section_info <nca_path> <section_num>
+# Sets the same NCA_SECTION_* globals nca_section_info (lib/nca_content.sh)
+# does.
+op_nca_section_info() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_section_info "$1" "$KEYS" "$2"
+    else
+        read_kv_into_vars "$SMTOOL" nca-section-info "$1" --keys "$KEYS" --section "$2"
+    fi
+}
+
+# op_nca_ctr_decrypt_section <nca_path> <key_hex> <ctr_hex> <byte_offset> <byte_size> <out_path>
+# Same contract as nca_ctr_decrypt_section (lib/nca_content.sh) - decrypts
+# byte_size bytes at byte_offset using AES-128-CTR with the given
+# already-derived key/initial-counter, writing plaintext to out_path.
+op_nca_ctr_decrypt_section() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_ctr_decrypt_section "$1" "$2" "$3" "$4" "$5" "$6"
+    else
+        "$SMTOOL" decrypt-section "$1" --key-hex "$2" --ctr "$3" --offset "$4" --size "$5" -o "$6"
+    fi
+}
+
+# op_nca_hierarchical_sha256_data_layer <nca_path> <section_num>
+# Echoes "<data_layer_offset> <data_layer_size>", same contract as
+# nca_hierarchical_sha256_data_layer. The compiled path needs the NCA's
+# header decrypted first (bin/smtool's own design: decrypt once, read
+# fields from the result - see nca-header-decrypt's own comment) - done
+# here via a throwaway temp file rather than exposing that as a separate
+# step to callers, since every other op_* wrapper's contract is "just
+# give me the field", not "manage your own decrypted-header lifetime".
+op_nca_hierarchical_sha256_data_layer() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_hierarchical_sha256_data_layer "$1" "$KEYS" "$2"
+    else
+        local hdr_tmp
+        hdr_tmp="$(mktemp)"
+        "$SMTOOL" nca-header-decrypt "$1" --keys "$KEYS" -o "$hdr_tmp" || { rm -f "$hdr_tmp"; return 1; }
+        "$SMTOOL" nca-hierarchical-sha256-layer "$hdr_tmp" --section "$2"
+        local rc=$?
+        rm -f "$hdr_tmp"
+        return $rc
+    fi
+}
+
+# op_nca_hierarchical_integrity_data_layer <nca_path> <section_num>
+# Same idea as op_nca_hierarchical_sha256_data_layer, for the IVFC/
+# HierarchicalIntegrity shape (nca_hierarchical_integrity_data_layer).
+op_nca_hierarchical_integrity_data_layer() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_hierarchical_integrity_data_layer "$1" "$KEYS" "$2"
+    else
+        local hdr_tmp
+        hdr_tmp="$(mktemp)"
+        "$SMTOOL" nca-header-decrypt "$1" --keys "$KEYS" -o "$hdr_tmp" || { rm -f "$hdr_tmp"; return 1; }
+        "$SMTOOL" nca-hierarchical-integrity-layer "$hdr_tmp" --section "$2"
+        local rc=$?
+        rm -f "$hdr_tmp"
+        return $rc
+    fi
+}
+
+# op_romfs_extract <romfs_file> <entry_name> <out_path>
+op_romfs_extract() {
+    if [ "$PURE" -eq 1 ]; then
+        romfs_extract "$1" "$2" "$3"
+    else
+        "$SMTOOL" romfs-extract "$1" "$2" "$3"
+    fi
+}
+
+# op_romfs_extract_all <romfs_file> <out_dir>
+op_romfs_extract_all() {
+    if [ "$PURE" -eq 1 ]; then
+        romfs_extract_all "$1" "$2"
+    else
+        "$SMTOOL" romfs-extract-all "$1" "$2"
+    fi
+}
+
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
 # NCA/tik/cert files - the pure-bash replacement for `nstool -x <out_dir>
@@ -352,12 +459,12 @@ extract_cnmt_from_meta_nca() {
     rights_id="$(op_nca_rights_id "$meta_nca")"
     [ -z "$rights_id" ] || { echo "extract_cnmt_from_meta_nca: $meta_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Meta NCA like this has been seen before" >&2; return 1; }
 
-    nca_section_info "$meta_nca" "$KEYS" 0
+    op_nca_section_info "$meta_nca" 0
     local key section_bin data_off data_size
-    key="$(nca_content_key_standard "$meta_nca" "$KEYS")" || return 1
+    key="$(op_nca_content_key_standard "$meta_nca")" || return 1
     section_bin="$(mktemp)"
-    nca_ctr_decrypt_section "$meta_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
-    read -r data_off data_size <<< "$(nca_hierarchical_sha256_data_layer "$meta_nca" "$KEYS" 0)"
+    op_nca_ctr_decrypt_section "$meta_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
+    read -r data_off data_size <<< "$(op_nca_hierarchical_sha256_data_layer "$meta_nca" 0)"
 
     local pfs0_bin="$section_bin.pfs0"
     tail -c +$((data_off + 1)) "$section_bin" | head -c "$data_size" > "$pfs0_bin"
@@ -391,18 +498,18 @@ extract_nacp_from_control_nca() {
     rights_id="$(op_nca_rights_id "$control_nca")"
     [ -z "$rights_id" ] || { echo "extract_nacp_from_control_nca: $control_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Control NCA like this has been seen before" >&2; return 1; }
 
-    nca_section_info "$control_nca" "$KEYS" 0
+    op_nca_section_info "$control_nca" 0
     local key section_bin data_off data_size
-    key="$(nca_content_key_standard "$control_nca" "$KEYS")" || return 1
+    key="$(op_nca_content_key_standard "$control_nca")" || return 1
     section_bin="$(mktemp)"
-    nca_ctr_decrypt_section "$control_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
-    read -r data_off data_size <<< "$(nca_hierarchical_integrity_data_layer "$control_nca" "$KEYS" 0)"
+    op_nca_ctr_decrypt_section "$control_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
+    read -r data_off data_size <<< "$(op_nca_hierarchical_integrity_data_layer "$control_nca" 0)"
 
     local romfs_bin="$section_bin.romfs"
     tail -c +$((data_off + 1)) "$section_bin" | head -c "$data_size" > "$romfs_bin"
     rm -f "$section_bin"
 
-    romfs_extract "$romfs_bin" "control.nacp" "$out_path"
+    op_romfs_extract "$romfs_bin" "control.nacp" "$out_path"
     local rc=$?
     rm -f "$romfs_bin"
     return $rc
@@ -724,11 +831,11 @@ merge_group() {
         # delta, confirmed on both this project's test titles).
         local sec base_romfs_section=-1 update_romfs_section=-1 update_exefs_section=-1
         for sec in 0 1 2 3; do
-            nca_section_info "$BASE_PROGRAM_SRC" "$KEYS" "$sec"
+            op_nca_section_info "$BASE_PROGRAM_SRC" "$sec"
             [ "$NCA_SECTION_PRESENT" = "1" ] && [ "$NCA_SECTION_CRYPT_TYPE" = "3" ] && base_romfs_section="$sec"
         done
         for sec in 0 1 2 3; do
-            nca_section_info "$PRIMARY_PROGRAM_SRC" "$KEYS" "$sec"
+            op_nca_section_info "$PRIMARY_PROGRAM_SRC" "$sec"
             if [ "$NCA_SECTION_PRESENT" = "1" ]; then
                 [ "$NCA_SECTION_CRYPT_TYPE" = "4" ] && update_romfs_section="$sec"
                 [ "$NCA_SECTION_CRYPT_TYPE" = "3" ] && update_exefs_section="$sec"
@@ -746,10 +853,10 @@ merge_group() {
         # plain byte offset once decrypted, nothing NCA-container-specific
         # about it).
         local BASE_ROMFS_DECRYPTED="$GROUP_WORK/base_romfs_decrypted.bin"
-        nca_section_info "$BASE_PROGRAM_SRC" "$KEYS" "$base_romfs_section"
+        op_nca_section_info "$BASE_PROGRAM_SRC" "$base_romfs_section"
         local base_key
-        base_key="$(nca_content_key_titlekey "$BASE_TITLEKEY" "$(nca_crypto_type "$BASE_PROGRAM_SRC" "$KEYS")" "$KEYS")"
-        nca_ctr_decrypt_section "$BASE_PROGRAM_SRC" "$base_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$BASE_ROMFS_DECRYPTED" || exit 1
+        base_key="$(op_nca_content_key_titlekey "$BASE_TITLEKEY" "$(op_nca_crypto_type "$BASE_PROGRAM_SRC")")"
+        op_nca_ctr_decrypt_section "$BASE_PROGRAM_SRC" "$base_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$BASE_ROMFS_DECRYPTED" || exit 1
 
         # Reconstruct the update's full virtual romfs (lib/bktr.sh, pure
         # bash - see that file's header comment for the relocation/
@@ -758,24 +865,24 @@ merge_group() {
         # exefs section into real directory trees, since hacpack's
         # --exefsdir/--romfsdir below want directories, not raw blobs.
         local update_key
-        update_key="$(nca_content_key_titlekey "$UPDATE_TITLEKEY" "$(nca_crypto_type "$PRIMARY_PROGRAM_SRC" "$KEYS")" "$KEYS")"
+        update_key="$(op_nca_content_key_titlekey "$UPDATE_TITLEKEY" "$(op_nca_crypto_type "$PRIMARY_PROGRAM_SRC")")"
         local RECON_ROMFS_BLOB="$GROUP_WORK/recon_romfs_blob.bin"
         bktr_reconstruct "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_key" "$update_romfs_section" "$BASE_ROMFS_DECRYPTED" "$RECON_ROMFS_BLOB" || exit 1
         rm -f "$BASE_ROMFS_DECRYPTED"
 
         local RECON_EXEFS="$GROUP_WORK/recon_exefs"
         local RECON_ROMFS="$GROUP_WORK/recon_romfs"
-        read -r romfs_data_off romfs_data_size <<< "$(nca_hierarchical_integrity_data_layer "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_romfs_section")"
+        read -r romfs_data_off romfs_data_size <<< "$(op_nca_hierarchical_integrity_data_layer "$PRIMARY_PROGRAM_SRC" "$update_romfs_section")"
         local RECON_ROMFS_DATA="$GROUP_WORK/recon_romfs_data.bin"
         tail -c +$((romfs_data_off + 1)) "$RECON_ROMFS_BLOB" | head -c "$romfs_data_size" > "$RECON_ROMFS_DATA"
         rm -f "$RECON_ROMFS_BLOB"
-        romfs_extract_all "$RECON_ROMFS_DATA" "$RECON_ROMFS"
+        op_romfs_extract_all "$RECON_ROMFS_DATA" "$RECON_ROMFS"
         rm -f "$RECON_ROMFS_DATA"
 
-        nca_section_info "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_exefs_section"
+        op_nca_section_info "$PRIMARY_PROGRAM_SRC" "$update_exefs_section"
         local EXEFS_SECTION_BIN="$GROUP_WORK/exefs_section.bin"
-        nca_ctr_decrypt_section "$PRIMARY_PROGRAM_SRC" "$update_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$EXEFS_SECTION_BIN" || exit 1
-        read -r exefs_data_off exefs_data_size <<< "$(nca_hierarchical_sha256_data_layer "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_exefs_section")"
+        op_nca_ctr_decrypt_section "$PRIMARY_PROGRAM_SRC" "$update_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$EXEFS_SECTION_BIN" || exit 1
+        read -r exefs_data_off exefs_data_size <<< "$(op_nca_hierarchical_sha256_data_layer "$PRIMARY_PROGRAM_SRC" "$update_exefs_section")"
         local EXEFS_PFS0="$GROUP_WORK/exefs_pfs0.bin"
         tail -c +$((exefs_data_off + 1)) "$EXEFS_SECTION_BIN" | head -c "$exefs_data_size" > "$EXEFS_PFS0"
         rm -f "$EXEFS_SECTION_BIN"

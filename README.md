@@ -1387,11 +1387,10 @@ above.
       and the resulting output NSPs were confirmed byte-for-byte identical
       (`cmp`) to each other.
 
-      **Not yet ported** (later phases, in order): NCA content-key
-      derivation, RomFs/BKTR readers, streaming AES-CTR content
-      decryption, RomFs writer, NCA builder (Meta then Program) — see
-      this project's own planning notes for the full phase-by-phase
-      breakdown if picking this back up.
+      **Not yet ported** at the time this entry was written (see the
+      Phase 3-5 entries directly below for what landed next): NCA
+      content-key derivation, RomFs/BKTR readers, streaming AES-CTR
+      content decryption, RomFs writer, NCA builder (Meta then Program).
 - [ ] **`smtool` (C port), Phase 2 of 9 — NCA header AES-XTS decrypt,
       implemented.** New `src/smtool/crypto.c`/`.h` wraps libcrypto's EVP
       API for raw AES-128-ECB (single/multi-block, no padding) — the one
@@ -1433,6 +1432,88 @@ above.
       endianness regression at all) — skipped automatically if no real
       `~/.switch/prod.keys` is present on the machine running the tests
       (can't be committed, console-specific).
+- [ ] **`smtool` (C port), Phase 3 of 9 — NCA content-key derivation,
+      implemented.** New subcommands in `src/smtool/nca_content.c`:
+      `nca-crypto-type` (the effective master-key generation index),
+      `nca-content-key-standard` (unwraps the header's own embedded
+      key-area slot 2 via `key_area_key_<family>_<gen>`), 
+      `nca-content-key-titlekey` (unwraps a raw ticket-encrypted titlekey
+      via `titlekek_<gen>`), and `nca-section-info` (per-section present/
+      offset/size/crypt-type/initial-AES-CTR-counter, including Nintendo's
+      non-standard `SectionCTR`-byte-reversed-plus-shifted-offset
+      construction). All four call the shared `nca_decrypt_header` from
+      Phase 2 once per invocation rather than re-deriving `header_key`
+      or re-decrypting per field. Verified against real files at every
+      level: `nca-content-key-standard` matches `lib/nca_content.sh`'s
+      own derivation on a real Control NCA; `nca-content-key-titlekey`
+      matches both the bash function AND `nstool`'s own "AES-CTR Key"
+      dump exactly on a real titlekey-crypto Program NCA (confirmed with
+      a genuinely nonzero `SectionCTR`, exercising the byte-reversal
+      logic for real, not as a zero-coincidence); `nca-section-info`'s
+      offset/size match `nstool -t nca -v`'s own reported partition
+      offset/size exactly. Wired into `switch-merge.sh` via four new
+      `op_*` wrappers covering all call sites (including the BKTR-
+      reconstruction path's titlekey-crypto key derivation). A full real
+      1G1R merge (titlekey-crypto NSP, standard-crypto XCI) still
+      produces byte-for-byte identical output via the compiled and
+      `--pure` paths.
+- [ ] **`smtool` (C port), Phase 4 of 9 — RomFs reader + BKTR bucket-tree
+      reader, implemented.** New `src/smtool/romfs.c` ports
+      `lib/romfs.sh`'s flat (`romfs-extract`) and full-recursive
+      (`romfs-extract-all`) RomFs readers. New `src/smtool/bktr.c` ports
+      the bucket-tree PARSING half of `lib/bktr.sh` (`bktr-headers`,
+      `bktr-relocations`, `bktr-subsections`) — full BKTR
+      reconstruction itself (`bktr_reconstruct`, which needs streaming
+      AES-CTR decryption of update content) stays bash-only until a
+      future phase, since no real update/BKTR sample file was available
+      to verify a C port of the reconstruction LOOP against, only the
+      table-parsing pieces (which don't need one — see below).
+
+      Verified: `romfs-extract`/`romfs-extract-all` match
+      `lib/romfs.sh`'s own output byte-for-byte on a real Control NCA's
+      RomFs data (checked into `tests/fixtures/control.romfs`).
+      `bktr-relocations`/`bktr-subsections` are verified against
+      HAND-CONSTRUCTED 2-bucket synthetic fixtures
+      (`tests/fixtures/bktr_reloc_2bucket.bin`/`bktr_subsec_2bucket.bin`)
+      specifically because this project already found and fixed a real
+      bug here once (an earlier wrong 0x4014/0x4010 "stride + overflow
+      entry" guess that read past the end of a real 29-bucket table —
+      the actual stride is a fixed 0x4000 bytes) — a single-bucket-only
+      test could not have caught a stride regression at all, since a
+      second bucket's start offset only matters once there IS one.
+      `bktr-headers` is verified against a hand-constructed decrypted-
+      header fixture with a real BKTR superblock at section 1 (and
+      deliberately none at section 0, confirming the bad-magic failure
+      path fires correctly too). A full real 1G1R merge (neither sample
+      exercises BKTR reconstruction itself, only the Control-NCA RomFs
+      read path) still produces byte-for-byte identical output via the
+      compiled and `--pure` paths.
+- [ ] **`smtool` (C port), Phase 5 of 9 — streaming AES-CTR content
+      decryption, implemented. This is the phase that delivers the real
+      speedup.** New `src/smtool/nca_decrypt.c`: `decrypt-section`
+      (streams AES-128-CTR decryption via libcrypto's EVP streaming API
+      with a fixed 1MB buffer, never loading a whole section into
+      memory — the direct in-process replacement for shelling out to
+      `openssl enc -aes-128-ctr` per section) and
+      `nca-hierarchical-sha256-layer`/`nca-hierarchical-integrity-layer`
+      (the two data-layer offset resolvers, operating on an
+      already-decrypted header file per Phase 2's "decrypt once" design).
+
+      Verified against real files: `decrypt-section`'s output is
+      byte-for-byte identical (`cmp`) to `lib/nca_content.sh`'s own
+      `nca_ctr_decrypt_section` on a real Control NCA's full 909KB romfs
+      section; both layer-resolvers match the bash functions' output
+      exactly (including a full round-trip: derive key → decrypt section
+      → resolve layer offset → extract cnmt → parse, entirely through
+      `smtool` subcommands, producing a cnmt byte-for-byte identical to
+      one independently verified earlier this session). A full real
+      1G1R merge (titlekey-crypto NSP, standard-crypto XCI) produced
+      byte-for-byte identical output via the compiled and `--pure`
+      paths — and, unlike every earlier phase, **the wall-clock time
+      difference is now real and large**: 10.5s (compiled) vs 43.3s
+      (`--pure`) for the same XCI merge, roughly a 4x speedup, confirming
+      the honest caveat from Phase 1's own entry above (the big win was
+      always expected here, not in the small struct-parsing phases).
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0
