@@ -16,8 +16,8 @@
 # stop the others.
 set -euo pipefail
 
-# Prefer the vendored copies of nstool/hacpack/hactool in ./bin (relative to
-# this script's own location, not the caller's cwd) over any system-wide
+# Prefer the vendored copies of hacpack/hactool in ./bin (relative to this
+# script's own location, not the caller's cwd) over any system-wide
 # install, so the project is self-contained and doesn't depend on whatever
 # version happens to be on PATH. Falls back to PATH if ./bin doesn't have
 # them (e.g. a fresh checkout without the binaries vendored in yet).
@@ -27,30 +27,130 @@ set -euo pipefail
 # empty romfs extraction) - see README's "The debugging story" for the
 # investigation and exact patch. Do not casually swap this back to a
 # system/AUR hactool without re-checking that fix is still needed/applied.
+# nstool is no longer required at all (see below) but bin/nstool is left
+# vendored/on PATH here too, harmlessly, in case it's ever useful for
+# manual debugging (nstool -t nca -v's human-readable dumps were used
+# throughout this project's own development to verify the pure-bash code
+# against).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SCRIPT_DIR/bin" ]; then
     PATH="$SCRIPT_DIR/bin:$PATH"
 fi
 
-# Pure-bash cnmt/NACP binary parsers (lib/binfmt.sh), NCA header AES-XTS
-# decryption (lib/nca_header.sh), and PFS0/NSP container packing
-# (lib/pfs0.sh) - reduces the dependency on nstool/hacpack for these
-# operations. See README's "The debugging story" for how these were
-# derived and verified against nstool's/hacpack's own output on real
-# files (including a real bug found and fixed along the way: bash
-# silently drops embedded NUL bytes from string variables, which broke
-# the PFS0 string table's null-terminated filenames until file writes
-# were changed to stream NULs directly via printf instead of building a
-# combined string first). NCA content partition decrypt/extract, NCA
-# packing (Program/Meta), and BKTR reconstruction still go through the
-# vendored nstool/hacpack/hactool, since those involve per-title
-# AES-CTR/titlekey crypto, hash-tree verification, and BKTR bucket-tree
-# parsing where a subtly wrong from-scratch implementation would silently
-# produce corrupted output rather than a clean error - not worth that risk
-# for what's already working, tested, patched-where-needed tooling.
+# Pure-bash cnmt/NACP/ticket binary parsers (lib/binfmt.sh), NCA header
+# AES-XTS decryption (lib/nca_header.sh), per-title NCA content-key
+# derivation and AES-CTR content decryption (lib/nca_content.sh), PFS0/NSP
+# container packing+unpacking (lib/pfs0.sh), and RomFs file-table reading
+# (lib/romfs.sh) - together these eliminate the dependency on nstool
+# entirely (see extract_nsp/extract_cnmt_from_meta_nca/
+# extract_nacp_from_control_nca below - every remaining nstool -x/-t nca -x
+# call site this project ever had is now one of these three functions).
+# See README's "The debugging story" and "Reduce dependency on vendored
+# tools" roadmap entries for how these were derived and verified against
+# nstool's/hacpack's own output on real files (including several real bugs
+# found and fixed along the way: bash silently drops embedded NUL bytes
+# from string variables, which broke the PFS0 string table's null-
+# terminated filenames until file writes were changed to stream NULs
+# directly via printf instead of building a combined string first; a
+# `while read ... done < <(...)` process substitution runs in a subshell,
+# so a variable the piped function sets as a side effect is invisible back
+# in the loop body - lib/pfs0.sh's data-offset lookup hit this and now
+# returns its result via a dedicated function call instead of a global;
+# and GNU dd's count=/skip= flags do NOT accept a bash-style 0x... hex
+# literal - lib/romfs.sh's header read silently got a `count=0` this way
+# until the literal was wrapped in `$(( ))` first). NCA content-partition
+# hash-tree verification, NCA *building* (Meta/Program - which needs to
+# write hash trees, not just read them), and BKTR reconstruction still go
+# through the vendored hacpack/hactool, since those involve hash-tree
+# verification/construction and BKTR bucket-tree parsing where a subtly
+# wrong from-scratch implementation would silently produce corrupted
+# output rather than a clean error - not worth that risk for what's
+# already working, tested, patched-where-needed tooling.
 source "$SCRIPT_DIR/lib/binfmt.sh"
 source "$SCRIPT_DIR/lib/nca_header.sh"
+source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
+source "$SCRIPT_DIR/lib/romfs.sh"
+
+# extract_nsp <nsp_path> <out_dir>
+# Splits an NSP (a plain, unencrypted PFS0 container) into its component
+# NCA/tik/cert files - the pure-bash replacement for `nstool -x <out_dir>
+# <nsp_path>`. No decryption needed at this level.
+extract_nsp() {
+    pfs0_extract_all "$1" "$2"
+}
+
+# extract_cnmt_from_meta_nca <meta_nca_path> <out_path>
+# Decrypts a Meta NCA's PartitionFs section (standard crypto - every real
+# Meta NCA seen so far has no RightsId, confirmed across every base/
+# update/DLC Meta NCA in this project's test titles) and extracts its
+# single .cnmt file to out_path - the pure-bash replacement for `nstool -t
+# nca -x <dir> <meta_nca_path>` at this project's cnmt-reading call sites.
+# Does NOT handle a titlekey-crypto Meta NCA (would need parse_tik +
+# nca_content_key_titlekey instead of nca_content_key_standard) since none
+# has ever been seen in practice - fails loudly via nca_rights_id's
+# nonempty result rather than silently guessing.
+extract_cnmt_from_meta_nca() {
+    local meta_nca="$1" out_path="$2"
+    local rights_id
+    rights_id="$(nca_rights_id "$meta_nca" "$KEYS")"
+    [ -z "$rights_id" ] || { echo "extract_cnmt_from_meta_nca: $meta_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Meta NCA like this has been seen before" >&2; return 1; }
+
+    nca_section_info "$meta_nca" "$KEYS" 0
+    local key section_bin data_off data_size
+    key="$(nca_content_key_standard "$meta_nca" "$KEYS")" || return 1
+    section_bin="$(mktemp)"
+    nca_ctr_decrypt_section "$meta_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
+    read -r data_off data_size <<< "$(nca_hierarchical_sha256_data_layer "$meta_nca" "$KEYS" 0)"
+
+    local pfs0_bin="$section_bin.pfs0"
+    tail -c +$((data_off + 1)) "$section_bin" | head -c "$data_size" > "$pfs0_bin"
+    rm -f "$section_bin"
+
+    local name off size
+    while read -r name off size; do
+        if [[ "$name" == *.cnmt ]]; then
+            pfs0_extract "$pfs0_bin" "$name" "$out_path"
+            rm -f "$pfs0_bin"
+            return 0
+        fi
+    done < <(_pfs0_read_entries "$pfs0_bin")
+    rm -f "$pfs0_bin"
+    echo "extract_cnmt_from_meta_nca: no .cnmt entry found in $meta_nca" >&2
+    return 1
+}
+
+# extract_nacp_from_control_nca <control_nca_path> <out_path>
+# Decrypts a Control NCA's RomFs section (standard crypto - same as every
+# other content NCA this project reads without a ticket) and extracts its
+# control.nacp file to out_path - the pure-bash replacement for `nstool -x
+# <dir> <control_nca_path>` at this project's one remaining nstool call
+# site. Uses lib/romfs.sh's flat-lookup RomFs reader, which only searches
+# the root directory - fine here, since every real Control NCA's RomFs
+# seen so far has every file (icons + control.nacp) directly in the root,
+# no subdirectories.
+extract_nacp_from_control_nca() {
+    local control_nca="$1" out_path="$2"
+    local rights_id
+    rights_id="$(nca_rights_id "$control_nca" "$KEYS")"
+    [ -z "$rights_id" ] || { echo "extract_nacp_from_control_nca: $control_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Control NCA like this has been seen before" >&2; return 1; }
+
+    nca_section_info "$control_nca" "$KEYS" 0
+    local key section_bin data_off data_size
+    key="$(nca_content_key_standard "$control_nca" "$KEYS")" || return 1
+    section_bin="$(mktemp)"
+    nca_ctr_decrypt_section "$control_nca" "$key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$section_bin" || { rm -f "$section_bin"; return 1; }
+    read -r data_off data_size <<< "$(nca_hierarchical_integrity_data_layer "$control_nca" "$KEYS" 0)"
+
+    local romfs_bin="$section_bin.romfs"
+    tail -c +$((data_off + 1)) "$section_bin" | head -c "$data_size" > "$romfs_bin"
+    rm -f "$section_bin"
+
+    romfs_extract "$romfs_bin" "control.nacp" "$out_path"
+    local rc=$?
+    rm -f "$romfs_bin"
+    return $rc
+}
 
 KEYS="$HOME/.switch/prod.keys"
 OUT_DIR="$SCRIPT_DIR/merged"
@@ -75,7 +175,6 @@ done
 # regardless of the caller's cwd, matching how ./bin is resolved above.
 [ "${#INPUTS[@]}" -gt 0 ] || INPUTS=("$SCRIPT_DIR")
 [ -f "$KEYS" ] || { echo "Keys file not found: $KEYS" >&2; exit 1; }
-command -v nstool >/dev/null || { echo "nstool not found in PATH" >&2; exit 1; }
 command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }
 command -v hactool >/dev/null || { echo "hactool not found in PATH" >&2; exit 1; }
 command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
@@ -105,9 +204,11 @@ mkdir -p "$OUT_DIR"
 
 # Classifies an NSP by its cnmt content-meta Type (Application/Patch/
 # AddOnContent) and its base title ID, without extracting the whole file -
-# just the Meta NCA (found via --fstree's virtual path listing) and its
-# cnmt payload, parsed directly via lib/binfmt.sh's parse_cnmt (no nstool
-# call for the cnmt itself). Echoes "<Type> <base_title_id>" on success.
+# just the Meta NCA (found by listing the NSP's own PFS0 entries via
+# lib/pfs0.sh's _pfs0_read_entries) and its cnmt payload (extract_cnmt_from_
+# meta_nca, pure bash - see its own comment above), parsed via
+# lib/binfmt.sh's parse_cnmt. No nstool call anywhere in this function.
+# Echoes "<Type> <base_title_id>" on success.
 #
 # The two non-Application cnmt shapes name the "base title ID" field
 # differently from Application's own TitleId - see README's "Switch
@@ -118,18 +219,19 @@ mkdir -p "$OUT_DIR"
 classify_nsp() {
     local nsp="$1"
     local tag="$2"
-    local meta_name meta_nca cnmt_dir cnmt_file base_id
-    meta_name="$(nstool -k "$KEYS" --fstree "$nsp" 2>/dev/null | grep -oP '[0-9a-fA-F]+\.cnmt\.nca' | head -n1)"
+    local meta_name meta_nca cnmt_file base_id
+    local name off size
+    while read -r name off size; do
+        [[ "$name" == *.cnmt.nca ]] && { meta_name="$name"; break; }
+    done < <(_pfs0_read_entries "$nsp")
     [ -n "$meta_name" ] || { echo "Could not find Meta NCA in $nsp" >&2; return 1; }
 
     meta_nca="$WORK/classify_${tag}_meta.nca"
-    nstool -k "$KEYS" -x "/${meta_name}" "$meta_nca" "$nsp" >/dev/null
+    pfs0_extract "$nsp" "$meta_name" "$meta_nca"
 
-    cnmt_dir="$WORK/classify_${tag}_cnmt"
-    mkdir -p "$cnmt_dir"
-    nstool -k "$KEYS" -t nca -x "$cnmt_dir" "$meta_nca" >/dev/null
-    cnmt_file="$(find "$cnmt_dir" -name '*.cnmt' | head -n1)"
-    [ -n "$cnmt_file" ] || { echo "Could not find .cnmt inside Meta NCA of $nsp" >&2; return 1; }
+    cnmt_file="$WORK/classify_${tag}.cnmt"
+    extract_cnmt_from_meta_nca "$meta_nca" "$cnmt_file" || return 1
+    [ -s "$cnmt_file" ] || { echo "Could not find .cnmt inside Meta NCA of $nsp" >&2; return 1; }
 
     parse_cnmt "$cnmt_file"
     [ -n "$CNMT_TYPE_NAME" ] || { echo "Could not determine content-meta type of $nsp" >&2; return 1; }
@@ -228,11 +330,11 @@ merge_group() {
     local PRIMARY_LABEL
     if [ -n "$UPDATE_NSP" ]; then
         echo "==> [$title_id] Extracting update NSP contents"
-        nstool -k "$KEYS" -x "$PRIMARY_DIR" "$UPDATE_NSP" >/dev/null
+        extract_nsp "$UPDATE_NSP" "$PRIMARY_DIR"
         PRIMARY_LABEL="update"
     else
         echo "==> [$title_id] No update given; using base NSP as primary source"
-        nstool -k "$KEYS" -x "$PRIMARY_DIR" "$BASE_NSP" >/dev/null
+        extract_nsp "$BASE_NSP" "$PRIMARY_DIR"
         PRIMARY_LABEL="base"
     fi
 
@@ -241,10 +343,9 @@ merge_group() {
     [ -n "$META_NCA" ] || { echo "[$title_id] Could not find Meta NCA in $PRIMARY_LABEL NSP" >&2; exit 1; }
 
     echo "==> [$title_id] Extracting $PRIMARY_LABEL cnmt"
-    nstool -k "$KEYS" -t nca -x "$CNMT_DIR" "$META_NCA" >/dev/null
-    local CNMT_FILE
-    CNMT_FILE="$(find "$CNMT_DIR" -name '*.cnmt' | head -n1)"
-    [ -n "$CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside $PRIMARY_LABEL Meta NCA" >&2; exit 1; }
+    local CNMT_FILE="$CNMT_DIR/primary.cnmt"
+    extract_cnmt_from_meta_nca "$META_NCA" "$CNMT_FILE" || exit 1
+    [ -s "$CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside $PRIMARY_LABEL Meta NCA" >&2; exit 1; }
 
     parse_cnmt "$CNMT_FILE"
 
@@ -282,14 +383,12 @@ merge_group() {
 
         local BASE_DIR="$GROUP_WORK/base_for_reconstruct"
         mkdir -p "$BASE_DIR"
-        nstool -k "$KEYS" -x "$BASE_DIR" "$BASE_NSP" >/dev/null
+        extract_nsp "$BASE_NSP" "$BASE_DIR"
 
-        local BASE_CNMT_NCA BASE_CNMT_EXTRACT_DIR BASE_CNMT_FILE BASE_PROGRAM_NCA_ID BASE_PROGRAM_SRC
+        local BASE_CNMT_NCA BASE_CNMT_FILE BASE_PROGRAM_NCA_ID BASE_PROGRAM_SRC
         BASE_CNMT_NCA="$(find "$BASE_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
-        BASE_CNMT_EXTRACT_DIR="$GROUP_WORK/base_cnmt_extract"
-        mkdir -p "$BASE_CNMT_EXTRACT_DIR"
-        nstool -k "$KEYS" -t nca -x "$BASE_CNMT_EXTRACT_DIR" "$BASE_CNMT_NCA" >/dev/null
-        BASE_CNMT_FILE="$(find "$BASE_CNMT_EXTRACT_DIR" -name '*.cnmt' | head -n1)"
+        BASE_CNMT_FILE="$GROUP_WORK/base.cnmt"
+        extract_cnmt_from_meta_nca "$BASE_CNMT_NCA" "$BASE_CNMT_FILE" || exit 1
         parse_cnmt "$BASE_CNMT_FILE"
         BASE_PROGRAM_NCA_ID="$CNMT_PROGRAM_ID"
         BASE_PROGRAM_SRC="$(find "$BASE_DIR" -maxdepth 1 -iname "${BASE_PROGRAM_NCA_ID}.nca" | head -n1)"
@@ -391,12 +490,9 @@ merge_group() {
     DRAFT_META_NCA="$(find "$META_BUILD_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
     [ -n "$DRAFT_META_NCA" ] || { echo "[$title_id] Meta NCA build did not produce output" >&2; exit 1; }
 
-    local DRAFT_CNMT_DIR="$GROUP_WORK/meta_build_cnmt"
-    mkdir -p "$DRAFT_CNMT_DIR"
-    nstool -k "$KEYS" -t nca -x "$DRAFT_CNMT_DIR" "$DRAFT_META_NCA" >/dev/null
-    local DRAFT_CNMT_FILE
-    DRAFT_CNMT_FILE="$(find "$DRAFT_CNMT_DIR" -name '*.cnmt' | head -n1)"
-    [ -n "$DRAFT_CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside rebuilt Meta NCA" >&2; exit 1; }
+    local DRAFT_CNMT_FILE="$GROUP_WORK/draft.cnmt"
+    extract_cnmt_from_meta_nca "$DRAFT_META_NCA" "$DRAFT_CNMT_FILE" || exit 1
+    [ -s "$DRAFT_CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside rebuilt Meta NCA" >&2; exit 1; }
 
     local CNMT_SIZE DIGEST
     CNMT_SIZE="$(stat -c%s "$DRAFT_CNMT_FILE")"
@@ -424,7 +520,7 @@ merge_group() {
         mkdir -p "$DLC_DIR"
 
         echo "==> [$title_id] Extracting DLC NSP: $(basename "$dlc_nsp")"
-        nstool -k "$KEYS" -x "$DLC_DIR" "$dlc_nsp" >/dev/null
+        extract_nsp "$dlc_nsp" "$DLC_DIR"
 
         DLC_META="$(find "$DLC_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
         [ -n "$DLC_META" ] || { echo "[$title_id] Could not find Meta NCA in DLC NSP: $dlc_nsp" >&2; exit 1; }
@@ -453,14 +549,11 @@ merge_group() {
     # NCA's NACP - the cnmt's own Version field is an internal integer
     # (e.g. v65536), not the "1.2.12"-style string players actually see.
     if [ -n "$CONTROL_NCA" ] && [ -f "$PACKED_NSP" ]; then
-        local NACP_EXTRACT_DIR="$GROUP_WORK/nacp_extract"
-        mkdir -p "$NACP_EXTRACT_DIR"
-        nstool -k "$KEYS" -x "$NACP_EXTRACT_DIR" "$MERGE_DIR/${CONTROL_NCA}.nca" >/dev/null 2>&1
-        local NACP_FILE
-        NACP_FILE="$(find "$NACP_EXTRACT_DIR" -name '*.nacp' | head -n1)"
+        local NACP_FILE="$GROUP_WORK/control.nacp"
+        extract_nacp_from_control_nca "$MERGE_DIR/${CONTROL_NCA}.nca" "$NACP_FILE" || NACP_FILE=""
 
         local GAME_NAME="" DISPLAY_VERSION=""
-        if [ -n "$NACP_FILE" ]; then
+        if [ -n "$NACP_FILE" ] && [ -s "$NACP_FILE" ]; then
             parse_nacp "$NACP_FILE"
             GAME_NAME="$NACP_NAME"
             DISPLAY_VERSION="$NACP_DISPLAY_VERSION"

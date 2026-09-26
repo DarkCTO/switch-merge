@@ -2,8 +2,10 @@
 
 Merges a Nintendo Switch base-game NSP with (optionally) its update NSP
 and (optionally) any number of DLC NSPs into a single installable NSP,
-natively on Linux via bash + `nstool` + `hacpack` + `hactool`. Built as a
-CLI-native replacement for
+natively on Linux via bash + `hacpack` + `hactool` (`nstool` is vendored
+too but no longer a runtime dependency — see "Reduce dependency on
+vendored tools" in the roadmap below). Built as a CLI-native replacement
+for
 [NSC_Builder](https://github.com/julesontheroad/NSC_BUILDER), which is
 Windows-first and currently archived.
 
@@ -28,11 +30,13 @@ document assumes it. If you just want to use the tool, skip to "Usage".
 - Your console's `prod.keys` at `~/.switch/prod.keys` (standard Lockpick_RCM
   output location).
 
-**No package install needed.** `nstool`, `hacpack`, and `hactool` are
-vendored directly in `bin/` — `switch-merge.sh` puts that directory first
-on `PATH` automatically, so the project is self-contained and doesn't
-depend on whatever version (if any) happens to be installed system-wide.
-This matters for `hactool` specifically: `bin/hactool` carries a local fix
+**No package install needed.** `hacpack` and `hactool` (the two tools the
+pipeline actually still calls — `nstool` is vendored alongside them too,
+purely for optional manual debugging) are vendored directly in `bin/` —
+`switch-merge.sh` puts that directory first on `PATH` automatically, so
+the project is self-contained and doesn't depend on whatever version (if
+any) happens to be installed system-wide. This matters for `hactool`
+specifically: `bin/hactool` carries a local fix
 for two real bugs in upstream 1.4.0 (the latest release, and still present
 at time of writing) that reject some legitimate update NCAs — see "The
 debugging story" below and `bin/patches/hactool-1.4.0-bktr-layout-fix.patch`
@@ -751,7 +755,7 @@ above.
 | NSC_Builder | Does the real job, but Windows-first, archived, GUI-oriented. The reason this project exists. |
 | `nsz` | Compress/decompress only (NSP↔NSZ, XCI↔XCZ). Not a content merger. |
 | `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta`/`--ncatype program` + `--ncadir` modes are exactly what's needed for building NCAs — see above. Its flat `--type nsp` container-packing role has since been replaced by this project's own `lib/pfs0.sh` (no crypto/hashing involved in that format, low risk to reimplement — see "The debugging story"), but `hacpack` is still used for the actual NCA-building steps (Meta, Program), which do involve encryption/hash-tree construction. |
-| `nstool` | Read/extract/verify only, no repack — used for the NCA/NSP extraction half of the pipeline (decrypting per-title content, which needs real key derivation this project deliberately hasn't reimplemented). Its own `--basenca` support turned out to need both sides' tickets simultaneously, which its single `--tik`/`--cert` flag pair can't express for base+update with different Rights IDs — `hactool` was used instead for the BKTR reconstruction step, since its `--titlekey=<raw>` + `--basenca=<plaintext nca>` combination doesn't have that limitation. cnmt/NACP field reading, NCA-header `RightsId` reading, and ticket (`.tik`) titlekey reading no longer use `nstool` at all — see `lib/binfmt.sh`/`lib/nca_header.sh`. |
+| `nstool` | **No longer used by the merge pipeline at all.** Every call site it used to have — cnmt/NACP field reading, NCA-header `RightsId` reading, ticket (`.tik`) titlekey reading, per-title content-key derivation + AES-CTR content decryption, NSP/NCA(PartitionFs) container splitting, and Control NCA `control.nacp` extraction (RomFs/`HierarchicalIntegrity`) — is now pure bash; see `lib/binfmt.sh`/`lib/nca_header.sh`/`lib/nca_content.sh`/`lib/pfs0.sh`/`lib/romfs.sh` and `switch-merge.sh`'s `extract_nsp`/`extract_cnmt_from_meta_nca`/`extract_nacp_from_control_nca`. Confirmed truly unused (not just untested) by temporarily replacing the vendored `bin/nstool` with a wrapper that fails loudly if invoked and re-running a full 1G1R batch merge end-to-end — it never fired. Still vendored in `bin/` for manual debugging (its human-readable `-v` dumps were how every pure-bash replacement above was originally verified), just no longer a runtime dependency. `hactool` remains for BKTR reconstruction — its own `--basenca` needs both sides' tickets simultaneously, which `nstool`'s single `--tik`/`--cert` flag pair couldn't express for base+update with different Rights IDs, and hash-tree verification/NCA-building is deliberately left to the vendored tools (see roadmap). |
 | `hactool` | Chosen for BKTR delta reconstruction (`--basenca` against a plaintext-decrypted base Program NCA) — see "The debugging story". Also used to decrypt a titlekey-crypto NCA to plaintext (`--plaintext=<file>`) as a prerequisite for that. Upstream 1.4.0 has a real, confirmed BKTR layout-validation bug (Bug #3) — this project vendors a locally-patched build in `bin/` rather than the stock release. |
 | `DarkMatterCore/nxdumptool` | Not used as a dependency, but its source was consulted directly to confirm hactool's BKTR checks are unnecessary (see Bug #3) — it successfully reads BKTR patch romfs with no equivalent pre-validation at all. |
 | `switch-merge-utility` (Rust, LordZeuss) | GUI-only, no documented CLI mode. |
@@ -865,6 +869,162 @@ above.
       container extraction (`-x`, `-t nca -x`) and everything involving
       per-title AES-CTR decryption/hash-tree verification — reimplementing
       that remains the same higher-risk tier described above.
+- [x] Reduce dependency on vendored tools, fourth piece — **primitive
+      implemented and verified, not yet wired into the merge pipeline**:
+      `lib/nca_content.sh` adds pure-bash per-title content-key derivation
+      and AES-128-CTR decryption of an NCA content section (Program/Data/
+      Control partitions), for both standard-crypto (unwrap the header's
+      own embedded key area with `key_area_key_<application|ocean|system>_
+      <generation>` from `prod.keys`) and titlekey-crypto (unwrap the
+      ticket's raw titlekey — `parse_tik`'s `TIK_TITLEKEY` — with
+      `titlekek_<generation>` instead) content. `openssl enc -aes-128-ctr`
+      handles a whole section in one subprocess call (confirmed on a real
+      195 MB Program romfs partition, ~0.6s) — unlike the header's AES-XTS,
+      CTR mode is natively supported by the `enc` CLI, so no per-block bash
+      loop is needed here. The non-obvious part was the AES-CTR initial
+      counter construction: the section's own `SectionCTR` FS-header field
+      (an opaque per-title "secure value", not an offset) forms the
+      counter's upper 8 bytes **byte-reversed**, and the section's absolute
+      byte offset within the NCA (shifted right 4, i.e. counted in 16-byte
+      AES-block units) forms the lower 8 bytes big-endian — not documented
+      in this much detail on switchbrew's wiki, so this project's own
+      vendored `hactool` 1.4.0 source (`nca.c`'s `nca_init_section_ctx()`)
+      was read directly as the authoritative reference instead of guessing.
+      Verified byte-for-byte against `nstool`'s own output on real files:
+      standard-crypto key/CTR derivation confirmed against a DLC Data NCA's
+      `nstool -t nca -v` dump, and its decrypted section found to contain
+      the exact bytes `nstool -t nca -x` extracted from it; titlekey-crypto
+      key/CTR derivation confirmed against Dicefolk's base Program NCA
+      (`nstool --tik --cert -t nca -v`, a case with a nonzero `SectionCTR`,
+      so the byte-reversal logic was genuinely exercised, not just an
+      all-zero coincidence), and its decrypted exefs section found to
+      contain all five files (`main`, `main.npdm`, `sdk`, `rtld`, `subsdk0`)
+      `nstool --tik --cert -t nca -x` extracted from the same NCA,
+      byte-for-byte. **Deliberately left unimplemented**: `AesCtrEx`
+      (BKTR-delta romfs) sections — Nintendo's per-subsection initial-
+      counter formula is real additional arithmetic beyond a plain section
+      offset, and wasn't attempted without verifying it first, so BKTR
+      reconstruction stays entirely on `hactool` as before — and hash-tree
+      (Merkle/`HierarchicalIntegrity`/`HierarchicalSha256`) verification,
+      left to `nstool`/`hactool` by design, not just deferred, since a
+      naive bash reimplementation is subprocess-spawn-bound (one SHA256 per
+      16 KB block — tens of seconds to minutes on a large partition) for a
+      correctness-only check that gains nothing from a bash rewrite.
+- [x] Reduce dependency on vendored tools, fifth piece — **wired into the
+      merge pipeline**: `lib/pfs0.sh` gained an unpack half (`pfs0_extract`,
+      `pfs0_extract_all`) alongside its existing packer, and
+      `switch-merge.sh` now has `extract_nsp` (splits an NSP - a plain,
+      unencrypted PFS0 - into its NCA/tik/cert files) and
+      `extract_cnmt_from_meta_nca` (decrypts a Meta NCA's PartitionFs
+      section via `lib/nca_content.sh` and pulls out its `.cnmt` via
+      `pfs0_extract`), replacing every `nstool -x` / `nstool -t nca -x`
+      call site in the classification and merge-group code paths. Every
+      real Meta NCA seen so far (base/update/DLC, both test titles) is
+      standard-crypto, so `extract_cnmt_from_meta_nca` only implements
+      that path and fails loudly (rather than guessing) if it ever meets a
+      titlekey-crypto one. Two real bugs surfaced and were fixed while
+      wiring this in:
+      - `dd bs=1` (fine for the tiny fixed-size header/entry-table reads
+        `_pfs0_read_entries` does) is unusably slow for actual file-sized
+        payloads — extracting a 370 MB entry this way was still running
+        after a minute before being killed. Fixed by switching the actual
+        data-copy `dd` calls to `bs=1M` with `iflag=skip_bytes,count_bytes`
+        (byte-precise skip/count even with a large block size) - the same
+        pattern `lib/nca_content.sh`'s `nca_ctr_decrypt_section` already
+        used correctly; extracting that same 370 MB entry now takes
+        well under a second.
+      - Reading a name out of the string table via
+        `dd ... | cut -d $'\0' -f1` looked correct in an isolated synthetic
+        test, but corrupted every name after the first when run against a
+        real NSP — each name ran together with the *next* entry's raw file
+        bytes, the same visible *symptom* as Bug #5 above, though confirmed
+        (by reproducing it against a materialized file, ruling out a
+        live-pipe-buffering explanation) to be a `cut`/pipe interaction
+        with embedded NULs specifically, not bash's own NUL-in-a-variable
+        behavior this time. Fixed by reading the whole entry+string table
+        as one hex blob (same approach the rest of this project's parsers
+        use) and scanning for the `00` byte pair in hex text instead of
+        piping raw bytes through `cut`.
+      - A third, subtler bug: `_pfs0_read_entries` originally set a
+        `PFS0_DATA_OFF` global as a side effect for callers to read after
+        the fact, but every caller consumed it via
+        `while read ... done < <(_pfs0_read_entries ...)` — a process
+        substitution that runs in its own subshell, so the global was
+        invisible back in the loop body (silently read as unset/0,
+        extracting every single entry from the wrong file offset). Fixed
+        by splitting a separate `_pfs0_data_off` function callers invoke
+        directly (via normal `$(...)` command substitution, which *does*
+        propagate a return value, just not a side-effect global) before
+        entering the loop, rather than relying on a global crossing a
+        subshell boundary.
+      Verified by re-running the full 1G1R batch merge (both Dicefolk,
+      which exercises BKTR reconstruction/titlekey crypto, and Well
+      Dweller, base+update with no DLC) end-to-end with the wired-in code
+      and confirming both output NSPs are byte-for-byte identical (`cmp`)
+      to the previously verified, hardware-tested outputs. At this point
+      `nstool` had exactly one remaining call site: extracting a merged
+      Control NCA's `control.nacp` for the output filename's display
+      name/version — Control NCAs use the RomFs/`HierarchicalIntegrity`
+      container format, not the simpler PartitionFs/`HierarchicalSha256`
+      format Meta NCAs use, which this project didn't parse yet at the
+      time.
+- [x] Reduce dependency on vendored tools, sixth piece — **`nstool`
+      eliminated entirely.** New `lib/romfs.sh` adds a pure-bash RomFs
+      file-table reader (flat, root-directory-only lookup by name — every
+      real Control NCA's RomFs seen so far has every file, icons +
+      `control.nacp`, directly in the root with no subdirectories, so a
+      full directory-tree walk wasn't needed and wasn't built) and
+      `switch-merge.sh` gained `extract_nacp_from_control_nca`
+      (decrypts a Control NCA's RomFs/`HierarchicalIntegrity` section via
+      `lib/nca_content.sh` — same AES-CTR decrypt as the Meta NCA case,
+      just a different, IVFC-shaped hash-layer header to skip past first —
+      then reads `control.nacp` out of it via `romfs_extract`), replacing
+      the pipeline's last `nstool` call site. `lib/nca_content.sh` also
+      gained `nca_hierarchical_integrity_data_layer`, the IVFC-format
+      counterpart to the existing `nca_hierarchical_sha256_data_layer` —
+      genuinely a different struct shape (an `IVFC`-magic'd header with a
+      variable `NumLevels` count of `{LogicalOffset, HashDataSize,
+      BlockSizeLog2, Reserved}` entries, where the DATA layer is at index
+      `NumLevels-2` because the last entry is an always-zero, unused
+      trailer — confirmed against a real Control NCA's own FS header and
+      `nstool -t nca -v`'s "HierarchicalIntegrity Header" dump, byte-for-
+      byte), not a variant of the PartitionFs/`HierarchicalSha256` one.
+      Two real bugs found while building this:
+      - `dd`'s `count=`/`skip=` flags do not accept a bash-style `0x...`
+        hex literal directly — passing one silently produces `count=0`
+        (with a warning easy to miss under `2>/dev/null`), not an error,
+        which looked at first like an empty/corrupt file rather than a
+        unit-conversion mistake. Every other hex constant in this
+        project's lib/*.sh files was already safe from this because it
+        only ever reached shell arithmetic contexts (`$(( ))`,
+        `${var:offset:len}`) — this was the first place a literal hex
+        constant was handed to an external command's own argument
+        parsing instead. Fixed by wrapping the literal in `$(( ))` first.
+      - The DATA layer being at index `NumLevels-2`, not `NumLevels-1`
+        like the PartitionFs case's `LayerCount-1`, was not obvious from
+        the wiki's field list alone — confirmed only by dumping a real
+        Control NCA's FS header bytes directly and finding the last
+        (`NumLevels-1`th) entry all-zero while the second-to-last matched
+        nstool's own reported Data Layer offset/size exactly.
+      Verified end-to-end: decrypted a real Control NCA's RomFs section,
+      extracted `control.nacp` via the new code, and confirmed it's
+      byte-for-byte identical (`cmp`) to `nstool -t nca -x`'s own
+      extraction of the same file. Then, to confirm `nstool` is TRULY
+      unused (not just unused by the code paths exercised in this
+      session's testing), the vendored `bin/nstool` binary was temporarily
+      replaced with a wrapper script that prints a loud message and exits
+      nonzero if ever invoked, and the full 1G1R batch merge (both test
+      titles, base+update+DLC and base+update) was re-run end-to-end: the
+      wrapper never fired, and both output NSPs were still byte-for-byte
+      identical to the previously hardware-verified references. `nstool`
+      remains vendored in `bin/` anyway (harmless, and still useful for
+      manually cross-checking this project's own pure-bash code against
+      real files, the same way it was used to build and verify everything
+      above), but the merge pipeline itself has zero remaining dependency
+      on it. **`hacpack`/`hactool` remain required** — NCA-building
+      (writing hash trees, not just reading them) and BKTR reconstruction
+      are still the deliberately-untouched higher-risk tier described in
+      the earlier roadmap entries above.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**
