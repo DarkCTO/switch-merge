@@ -474,6 +474,357 @@ static int cmd_build_meta_nca_impl(const char *out_nca, const char *keys_path, c
     return 0;
 }
 
+/* --- Program NCA assembly (nca_build_program) ---
+ *
+ * Builds a complete, PLAINTEXT (crypt_type=None, matching hacpack's own
+ * --plaintext) Program NCA from an ORDERED list of exefs file paths
+ * (the original container order, NOT filesystem/readdir order - see
+ * lib/nca_build.sh's own comment on why: relying on readdir() to
+ * recover the original PFS0 order is fragile/filesystem-dependent) and
+ * a real romfs directory tree (built via Phase 6's own romfs-build
+ * logic, called in-process here rather than as a subprocess - the whole
+ * point of landing Phase 6 before this one).
+ *
+ * One of the exefs files MUST be named "main.npdm" - its ACID
+ * signature/key get zeroed (mirrors hacpack's own npdm_process, which
+ * does this to every exefs it packs unless --nozeroacidsig/
+ * --nozeroacidkey are passed - this project never passes either).
+ */
+
+extern int cmd_pfs0_pack(int argc, char **argv);
+
+/* zero_npdm_acid <main_npdm_path>
+ * Zeroes main.npdm's ACID signature (0x100 bytes at acid_offset) and
+ * RSA modulus/"key" (the next 0x100 bytes) in place - exact port of
+ * nca_build_zero_npdm_acid. acid_offset itself is a u32 at file offset
+ * 0x78, pointing at the START of npdm_acid_t (its signature field, NOT
+ * the "ACID" magic, which is the 3rd field at acid_offset+0x200). */
+static int zero_npdm_acid(const char *npdm_path) {
+    FILE *f = fopen(npdm_path, "r+b");
+    if (!f) { fprintf(stderr, "build-program-nca: could not open %s\n", npdm_path); return 1; }
+    unsigned char acid_off_bytes[4];
+    fseeko(f, 0x78, SEEK_SET);
+    if (fread(acid_off_bytes, 1, 4, f) != 4) { fclose(f); return 1; }
+    uint32_t acid_offset = (uint32_t)acid_off_bytes[0] | ((uint32_t)acid_off_bytes[1] << 8) |
+                            ((uint32_t)acid_off_bytes[2] << 16) | ((uint32_t)acid_off_bytes[3] << 24);
+    unsigned char zeros[0x200] = {0};
+    fseeko(f, acid_offset, SEEK_SET);
+    fwrite(zeros, 1, sizeof(zeros), f);
+    fclose(f);
+    return 0;
+}
+
+/* ivfc_hash_level <src_path> <out_path> -> padded out_size
+ * One IVFC recursion step: writes a SHA256 hash per 0x4000-byte block of
+ * src_path to out_path, padded to a multiple of 0x4000 at the end -
+ * exact port of _nca_build_ivfc_level. */
+static int ivfc_hash_level(const char *src_path, const char *out_path, uint64_t *out_size) {
+    unsigned char *hashes;
+    uint64_t hashes_size;
+    if (hash_blocks(src_path, 0x4000, &hashes, &hashes_size) != 0) return 1;
+    uint64_t padded = (hashes_size + 0x3FFF) & ~(uint64_t)0x3FFF;
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) { free(hashes); return 1; }
+    fwrite(hashes, 1, hashes_size, out);
+    if (padded > hashes_size) {
+        unsigned char z = 0;
+        for (uint64_t i = 0; i < padded - hashes_size; i++) fwrite(&z, 1, 1, out);
+    }
+    fclose(out);
+    free(hashes);
+    *out_size = padded;
+    return 0;
+}
+
+static uint64_t file_size_u64(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseeko(f, 0, SEEK_END);
+    uint64_t sz = (uint64_t)ftello(f);
+    fclose(f);
+    return sz;
+}
+
+int cmd_build_program_nca(int argc, char **argv) {
+    const char *out_nca = NULL, *keys_path = NULL, *title_id_hex = NULL, *romfs_dir = NULL;
+    char *exefs_files[64];
+    int exefs_count = 0;
+    int positional = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--keys") == 0 && i + 1 < argc) { keys_path = argv[++i]; }
+        else if (strcmp(argv[i], "--romfs-dir") == 0 && i + 1 < argc) { romfs_dir = argv[++i]; }
+        else if (strcmp(argv[i], "--exefs") == 0 && i + 1 < argc) {
+            if (exefs_count < 64) exefs_files[exefs_count++] = argv[++i];
+            else { fprintf(stderr, "build-program-nca: too many --exefs files\n"); return 1; }
+        }
+        else {
+            switch (positional) {
+                case 0: out_nca = argv[i]; break;
+                case 1: title_id_hex = argv[i]; break;
+            }
+            positional++;
+        }
+    }
+    if (!out_nca || !title_id_hex || !keys_path || !romfs_dir || exefs_count == 0) {
+        fprintf(stderr, "usage: smtool build-program-nca <out_nca> <title_id_hex> --keys <keys_file> --romfs-dir <dir> --exefs <file> [--exefs <file> ...]\n");
+        return 1;
+    }
+
+    char work_dir[] = "/tmp/smtool_program_XXXXXX";
+    if (!mkdtemp(work_dir)) { fprintf(stderr, "build-program-nca: mkdtemp failed\n"); return 1; }
+
+    /* --- Section 0: exefs (PFS0, HierarchicalSha256, 0x10000 hash blocks) --- */
+    char npdm_copy[600] = "";
+    char *exefs_fixed[64];
+    for (int i = 0; i < exefs_count; i++) {
+        const char *base = strrchr(exefs_files[i], '/');
+        base = base ? base + 1 : exefs_files[i];
+        if (strcmp(base, "main.npdm") == 0) {
+            snprintf(npdm_copy, sizeof(npdm_copy), "%s/main.npdm", work_dir);
+            FILE *src = fopen(exefs_files[i], "rb");
+            FILE *dst = fopen(npdm_copy, "wb");
+            unsigned char buf[65536];
+            size_t got;
+            while ((got = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, got, dst);
+            fclose(src);
+            fclose(dst);
+            if (zero_npdm_acid(npdm_copy) != 0) return 1;
+            exefs_fixed[i] = npdm_copy;
+        } else {
+            exefs_fixed[i] = exefs_files[i];
+        }
+    }
+    if (npdm_copy[0] == '\0') {
+        fprintf(stderr, "build-program-nca: no main.npdm found in --exefs file list\n");
+        return 1;
+    }
+
+    char exefs_pfs0[600];
+    snprintf(exefs_pfs0, sizeof(exefs_pfs0), "%s/exefs.pfs0", work_dir);
+    {
+        char *pack_argv[66];
+        pack_argv[0] = exefs_pfs0;
+        for (int i = 0; i < exefs_count; i++) pack_argv[1 + i] = exefs_fixed[i];
+        pack_argv[1 + exefs_count] = NULL;
+        if (cmd_pfs0_pack(1 + exefs_count, pack_argv) != 0) return 1;
+    }
+
+    const uint64_t exefs_block_size = 65536;
+    unsigned char *exefs_hashtable_buf;
+    uint64_t exefs_hashtable_size;
+    if (hash_blocks(exefs_pfs0, exefs_block_size, &exefs_hashtable_buf, &exefs_hashtable_size) != 0) return 1;
+    uint64_t exefs_hashtable_padded = (exefs_hashtable_size + 0x1FF) & ~(uint64_t)0x1FF;
+    unsigned char *exefs_hashtable_padded_buf = calloc(1, exefs_hashtable_padded);
+    memcpy(exefs_hashtable_padded_buf, exefs_hashtable_buf, exefs_hashtable_size);
+
+    uint64_t exefs_pfs0_offset = exefs_hashtable_padded;
+    uint64_t exefs_pfs0_size = file_size_u64(exefs_pfs0);
+
+    unsigned char exefs_master_hash[32];
+    {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(ctx, exefs_hashtable_padded_buf, exefs_hashtable_size);
+        unsigned int outlen;
+        EVP_DigestFinal_ex(ctx, exefs_master_hash, &outlen);
+        EVP_MD_CTX_free(ctx);
+    }
+
+    uint64_t exefs_raw_size = exefs_pfs0_offset + exefs_pfs0_size;
+    uint64_t exefs_section_size = (exefs_raw_size + 0x1FF) & ~(uint64_t)0x1FF;
+    uint64_t exefs_trailing_pad = exefs_section_size - exefs_raw_size;
+
+    unsigned char exefs_fs_header[0x200] = {0};
+    le_put_u16(exefs_fs_header + 0x0, 2);
+    exefs_fs_header[0x2] = 1; /* fs_type = PFS0 */
+    exefs_fs_header[0x3] = 2; /* hash_type = PFS0 */
+    exefs_fs_header[0x4] = 1; /* crypt_type = None (plaintext) */
+    memcpy(exefs_fs_header + 0x8, exefs_master_hash, 32);
+    le_put_u32(exefs_fs_header + 0x28, (uint32_t)exefs_block_size);
+    le_put_u32(exefs_fs_header + 0x2C, 2);
+    le_put_u64(exefs_fs_header + 0x30, 0);
+    le_put_u64(exefs_fs_header + 0x38, exefs_hashtable_size);
+    le_put_u64(exefs_fs_header + 0x40, exefs_pfs0_offset);
+    le_put_u64(exefs_fs_header + 0x48, exefs_pfs0_size);
+
+    unsigned char exefs_section_hash[32];
+    {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(ctx, exefs_fs_header, sizeof(exefs_fs_header));
+        unsigned int outlen;
+        EVP_DigestFinal_ex(ctx, exefs_section_hash, &outlen);
+        EVP_MD_CTX_free(ctx);
+    }
+
+    /* --- Section 1: romfs (built via Phase 6's romfs-build, in-process,
+     * then IVFC-hashed) --- path[5]=raw romfs, path[0..4]=5 recursive
+     * hash levels, level_headers[N].hash_data_size for EVERY N is that
+     * level's OWN (already-padded, for N<5; naturally block-aligned
+     * already for N=5) file size - confirmed by reading hacpack's exact
+     * call site (ivfc_create_level writes TO path[b] FROM path[b+1],
+     * size captured is path[b]'s own). */
+    char ivfc_path5[600], ivfc_path4[600], ivfc_path3[600], ivfc_path2[600], ivfc_path1[600], ivfc_path0[600];
+    snprintf(ivfc_path5, sizeof(ivfc_path5), "%s/romfs.bin", work_dir);
+    snprintf(ivfc_path4, sizeof(ivfc_path4), "%s/ivfc4.bin", work_dir);
+    snprintf(ivfc_path3, sizeof(ivfc_path3), "%s/ivfc3.bin", work_dir);
+    snprintf(ivfc_path2, sizeof(ivfc_path2), "%s/ivfc2.bin", work_dir);
+    snprintf(ivfc_path1, sizeof(ivfc_path1), "%s/ivfc1.bin", work_dir);
+    snprintf(ivfc_path0, sizeof(ivfc_path0), "%s/ivfc0.bin", work_dir);
+
+    /* romfs_build_impl's own *out_unpadded_size param gives us the
+     * UNPADDED size directly, in-process - no subprocess/pipe needed
+     * (this is exactly the field this project's own README documents as
+     * a real, confirmed bug-source if mixed up with the padded on-disk
+     * size: level 5's hash_data_size must be the UNPADDED size). */
+    uint64_t ivfc_size5;
+    if (romfs_build_impl(romfs_dir, ivfc_path5, &ivfc_size5) != 0) {
+        fprintf(stderr, "build-program-nca: romfs-build failed\n");
+        return 1;
+    }
+
+    uint64_t ivfc_size4, ivfc_size3, ivfc_size2, ivfc_size1, ivfc_size0;
+    if (ivfc_hash_level(ivfc_path5, ivfc_path4, &ivfc_size4) != 0) return 1;
+    if (ivfc_hash_level(ivfc_path4, ivfc_path3, &ivfc_size3) != 0) return 1;
+    if (ivfc_hash_level(ivfc_path3, ivfc_path2, &ivfc_size2) != 0) return 1;
+    if (ivfc_hash_level(ivfc_path2, ivfc_path1, &ivfc_size1) != 0) return 1;
+    if (ivfc_hash_level(ivfc_path1, ivfc_path0, &ivfc_size0) != 0) return 1;
+
+    uint64_t ivfc_off0 = 0;
+    uint64_t ivfc_off1 = ivfc_off0 + ivfc_size0;
+    uint64_t ivfc_off2 = ivfc_off1 + ivfc_size1;
+    uint64_t ivfc_off3 = ivfc_off2 + ivfc_size2;
+    uint64_t ivfc_off4 = ivfc_off3 + ivfc_size3;
+    uint64_t ivfc_off5 = ivfc_off4 + ivfc_size4;
+
+    unsigned char ivfc_master_hash[32];
+    if (sha256_file(ivfc_path0, ivfc_master_hash) != 0) return 1;
+
+    /* IVFC header: magic("IVFC") + id(0x20000) + master_hash_size(0x20) +
+     * num_levels(7) + 6 level headers + pad(0x20) + master_hash(0x20). */
+    unsigned char ivfc_hdr[0xE0] = {0};
+    memcpy(ivfc_hdr, "IVFC", 4);
+    le_put_u32(ivfc_hdr + 4, 0x20000);
+    le_put_u32(ivfc_hdr + 8, 0x20);
+    le_put_u32(ivfc_hdr + 12, 7);
+    uint64_t level_offs[6] = { ivfc_off0, ivfc_off1, ivfc_off2, ivfc_off3, ivfc_off4, ivfc_off5 };
+    uint64_t level_sizes[6] = { ivfc_size0, ivfc_size1, ivfc_size2, ivfc_size3, ivfc_size4, ivfc_size5 };
+    for (int i = 0; i < 6; i++) {
+        unsigned char *lvl = ivfc_hdr + 16 + i * 0x18;
+        le_put_u64(lvl, level_offs[i]);
+        le_put_u64(lvl + 8, level_sizes[i]);
+        le_put_u32(lvl + 16, 0xE);
+        le_put_u32(lvl + 20, 0);
+    }
+    memcpy(ivfc_hdr + 0xC0, ivfc_master_hash, 32);
+
+    uint64_t ivfc_path5_actual_size = file_size_u64(ivfc_path5);
+    uint64_t romfs_raw_size = ivfc_off5 + ivfc_path5_actual_size;
+    uint64_t romfs_section_size = (romfs_raw_size + 0x1FF) & ~(uint64_t)0x1FF;
+    uint64_t romfs_trailing_pad = romfs_section_size - romfs_raw_size;
+
+    unsigned char romfs_fs_header[0x200] = {0};
+    le_put_u16(romfs_fs_header + 0x0, 2);
+    romfs_fs_header[0x2] = 0; /* fs_type = RomFs */
+    romfs_fs_header[0x3] = 3; /* hash_type = RomFs/HierarchicalIntegrity */
+    romfs_fs_header[0x4] = 1; /* crypt_type = None (plaintext) */
+    memcpy(romfs_fs_header + 0x8, ivfc_hdr, sizeof(ivfc_hdr));
+    /* remaining bytes to 0x138 (romfs_superblock total size): zero -
+     * relocation_header/subsection_header (no BKTR here) already zero. */
+
+    unsigned char romfs_section_hash[32];
+    {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(ctx, romfs_fs_header, sizeof(romfs_fs_header));
+        unsigned int outlen;
+        EVP_DigestFinal_ex(ctx, romfs_section_hash, &outlen);
+        EVP_MD_CTX_free(ctx);
+    }
+
+    /* --- Assemble the full header --- */
+    uint32_t exefs_media_end = (uint32_t)((0xC00 + exefs_section_size) / 0x200);
+    uint64_t total_size = 0xC00 + exefs_section_size + romfs_section_size;
+    uint32_t romfs_media_start = exefs_media_end;
+    uint32_t romfs_media_end = (uint32_t)(total_size / 0x200);
+
+    unsigned char main_hdr[NCA_HEADER_SIZE] = {0};
+    memcpy(main_hdr + 0x200, "NCA3", 4);
+    main_hdr[0x204] = 0; /* distribution = download */
+    main_hdr[0x205] = 0; /* content_type = Program */
+    main_hdr[0x206] = 0;
+    main_hdr[0x207] = 0;
+    le_put_u64(main_hdr + 0x208, total_size);
+    le_put_u64(main_hdr + 0x210, strtoull(title_id_hex, NULL, 16));
+    le_put_u32(main_hdr + 0x21C, 0xc1100);
+    main_hdr[0x220] = 0;
+
+    le_put_u32(main_hdr + 0x240, 6);
+    le_put_u32(main_hdr + 0x244, exefs_media_end);
+    main_hdr[0x248] = 1;
+    le_put_u32(main_hdr + 0x250, romfs_media_start);
+    le_put_u32(main_hdr + 0x254, romfs_media_end);
+    main_hdr[0x258] = 1;
+
+    memcpy(main_hdr + 0x280, exefs_section_hash, 32);
+    memcpy(main_hdr + 0x2A0, romfs_section_hash, 32);
+
+    unsigned char plaintext_keys[0x40] = {0};
+    memset(plaintext_keys + 0x20, 0x04, 16);
+    char *kaek_hex = keys_file_lookup(keys_path, "key_area_key_application_00", 32);
+    if (!kaek_hex) { fprintf(stderr, "build-program-nca: key_area_key_application_00 not found\n"); return 1; }
+    size_t kaek_len;
+    unsigned char *kaek = hex_decode(kaek_hex, &kaek_len);
+    free(kaek_hex);
+    if (!kaek || kaek_len != 16) { fprintf(stderr, "build-program-nca: bad kaek\n"); free(kaek); return 1; }
+    unsigned char encrypted_keys[0x40];
+    for (int i = 0; i < 4; i++) {
+        if (aes128_ecb_block(1, kaek, plaintext_keys + i * 16, encrypted_keys + i * 16) != 0) { free(kaek); return 1; }
+    }
+    free(kaek);
+    memcpy(main_hdr + 0x300, encrypted_keys, 0x40);
+
+    memcpy(main_hdr + 0x400, exefs_fs_header, sizeof(exefs_fs_header));
+    memcpy(main_hdr + 0x600, romfs_fs_header, sizeof(romfs_fs_header));
+
+    unsigned char encrypted_header[NCA_HEADER_SIZE];
+    if (nca_encrypt_header(main_hdr, keys_path, encrypted_header) != 0) {
+        fprintf(stderr, "build-program-nca: header encryption failed\n");
+        return 1;
+    }
+
+    FILE *out = fopen(out_nca, "wb");
+    if (!out) { fprintf(stderr, "build-program-nca: could not open %s\n", out_nca); return 1; }
+    fwrite(encrypted_header, 1, sizeof(encrypted_header), out);
+    fwrite(exefs_hashtable_padded_buf, 1, exefs_hashtable_padded, out);
+    {
+        FILE *src = fopen(exefs_pfs0, "rb");
+        unsigned char buf[65536];
+        size_t got;
+        while ((got = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, got, out);
+        fclose(src);
+    }
+    if (exefs_trailing_pad > 0) { unsigned char z = 0; for (uint64_t i = 0; i < exefs_trailing_pad; i++) fwrite(&z, 1, 1, out); }
+    {
+        const char *ivfc_paths[6] = { ivfc_path0, ivfc_path1, ivfc_path2, ivfc_path3, ivfc_path4, ivfc_path5 };
+        for (int i = 0; i < 6; i++) {
+            FILE *src = fopen(ivfc_paths[i], "rb");
+            unsigned char buf[65536];
+            size_t got;
+            while ((got = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, got, out);
+            fclose(src);
+        }
+    }
+    if (romfs_trailing_pad > 0) { unsigned char z = 0; for (uint64_t i = 0; i < romfs_trailing_pad; i++) fwrite(&z, 1, 1, out); }
+    fclose(out);
+
+    free(exefs_hashtable_buf);
+    free(exefs_hashtable_padded_buf);
+    return 0;
+}
+
 int cmd_build_meta_nca(int argc, char **argv) {
     const char *out_nca = NULL, *keys_path = NULL, *title_id_hex = NULL, *title_version_str = NULL;
     const char *program_nca = "", *control_nca = "", *legal_nca = "", *data_nca = "", *digest_hex = "";

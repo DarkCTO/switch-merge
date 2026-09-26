@@ -26,7 +26,17 @@ document assumes it. If you just want to use the tool, skip to "Usage".
 - `openssl` (near-universal) — used by `lib/nca_header.sh` as a raw
   AES-128-ECB block-cipher primitive, to build AES-XTS decryption of the
   NCA header from scratch (the `openssl enc` CLI has no XTS mode of its
-  own — see "The debugging story" below for why).
+  own — see "The debugging story" below for why). Only needed for the
+  `--pure` (bash-only) path — the default path's own crypto is `smtool`'s
+  compiled-in libcrypto, not the `openssl` CLI.
+- **`bin/smtool`, this project's own C reimplementation of the
+  performance-critical pipeline** (see "smtool" below) — build once with
+  `make -C src/smtool` (needs `gcc`/`cc` and OpenSSL dev headers,
+  `libssl-dev`/`openssl-devel` depending on distro, at BUILD time only;
+  confirmed working with OpenSSL 3.6.4 and gcc 16.2.1). Required unless
+  `--pure` is passed, in which case the script falls back to the slower,
+  zero-compiled-dependency bash implementation instead and `smtool`
+  doesn't need to exist at all.
 - Your console's `prod.keys` at `~/.switch/prod.keys` (standard Lockpick_RCM
   output location).
 
@@ -758,6 +768,71 @@ Control/LegalInformation NCAs, and the DLC's own Meta + Data NCAs — no
 tickets needed, since the rebuilt Program NCA has no RightsId and the DLC's
 Data NCA never had one. Confirmed via `nstool --fstree` / `nstool -y`, and
 installed + played correctly on real hardware.
+
+## smtool
+
+The bash pipeline described above is entirely dependency-minimal by
+design, but was measured to be roughly two orders of magnitude slower
+than the vendored C tools doing equivalent work (extracting a real
+2.6GB XCI: 74.6s vs `hactool`'s 0.77s) — dominated by per-byte hex-
+string parsing in bash and hundreds of `dd`/`xxd`/`openssl` subprocess
+spawns per merge, neither of which is tunable further inside bash
+itself.
+
+`src/smtool/` is a from-scratch C reimplementation of every
+performance-critical piece of the pipeline above — both the binary/
+struct parsing (cnmt/NACP/ticket/PFS0/HFS0/RomFs/BKTR-bucket-tree) and
+the crypto (AES-XTS header decrypt/encrypt, AES-CTR content decrypt/
+encrypt, per-title key derivation, SHA256 hash trees), all linking
+libcrypto (OpenSSL) rather than shelling out to the `openssl` CLI.
+Build it once with `make -C src/smtool` (produces `bin/smtool`); it's
+required by default, unless `--pure` is passed, in which case
+`switch-merge.sh` calls the original `lib/*.sh` bash functions directly
+instead (slower, but zero compiled dependency beyond `xxd`/`openssl`
+as already documented above).
+
+`bin/smtool <subcommand> <args...>` — one-shot subcommands, spawned
+exactly like the vendored `nstool`/`hacpack`/`hactool` always have been
+(one process per operation, do one thing, exit; run `bin/smtool` with
+no arguments for the full subcommand list). Multi-field results are
+printed as `KEY=VALUE` lines, one per line, named identically to the
+bash globals they replace (e.g. `nca-section-info` prints
+`NCA_SECTION_OFFSET=...` exactly like `lib/nca_content.sh`'s
+`nca_section_info` sets `NCA_SECTION_OFFSET` as a real bash global) —
+read back into `switch-merge.sh` via a small shared `read_kv_into_vars`
+helper. Every call site in `switch-merge.sh` is routed through a
+matching `op_*` wrapper function (`op_parse_cnmt`, `op_nca_rights_id`,
+`op_nca_build_program`, etc.), each branching on a single `PURE`
+variable — never a per-call-site `if $PURE` scattered through the
+pipeline, so both the compiled and `--pure` code paths stay in exactly
+one place to keep in sync.
+
+This was built incrementally, phase by phase (mirroring how the
+original bash port itself was built — see the numbered `smtool`
+roadmap entries below for the full phase-by-phase history, what each
+one verified, and the real bugs caught along the way): pure struct
+parsing first (lowest risk, no crypto), then NCA header crypto, then
+content-key derivation, then RomFs/BKTR readers, then the streaming
+AES-CTR content decryption that turned out to be the first phase with
+a genuinely large measured speedup, then the RomFs and NCA (Meta,
+Program) *writers*. Every phase was verified against this project's
+own existing bash implementation (byte-for-byte, `cmp`, on real files
+wherever a real sample was available) and, at the NCA-building phases
+specifically, independently cross-checked against `nstool` — real
+external ground truth, not just self-consistency between this
+project's own two implementations of itself. `tests/run.sh` (a small
+fixture harness under `tests/fixtures/`) automates most of this
+verification and can be re-run at any time with `bash tests/run.sh` —
+crypto-dependent tests skip automatically if no real
+`~/.switch/prod.keys` is present on the machine running them, so the
+suite still gives full coverage of every fixture that doesn't need one
+even in a clean checkout.
+
+**Total measured speedup, full pipeline compiled**: 3.9s vs 43.0s for
+the same real XCI merge (~11x) — see the roadmap entries below for the
+step-by-step progression (Phase 1's own honest finding that early
+phases barely moved the needle, through Phase 5's first large jump,
+to this final number).
 
 ## Known issues encountered
 
@@ -1608,10 +1683,66 @@ above.
       cnmt was extracted and confirmed to have a genuinely correct,
       self-verifying SHA256 digest over its own preceding bytes.
 
-      **Not wired into `switch-merge.sh` yet** — `nca_build_meta` is
-      only ever called from the same `merge_group` code path Phase 8's
-      `nca_build_program` will also need to replace, so both land
-      together in one cutover rather than partially wiring one half now.
+- [ ] **`smtool` (C port), Phase 8 of 9 — NCA builder: Program NCA,
+      implemented, AND cutover wired.** New `build-program-nca`
+      subcommand in `src/smtool/nca_build.c` completes the NCA-building
+      half: exefs (PFS0 pack with `main.npdm`'s ACID sig/key zeroed,
+      0x10000-byte hash blocks) + romfs (Phase 6's `romfs_build_impl`
+      called IN-PROCESS, no subprocess spawn at all — refactored
+      `romfs-build`'s own CLI entry point into a thin wrapper around
+      this shared implementation specifically so this phase could call
+      it directly) + 5 recursive IVFC hash levels + full header
+      assembly. This phase, together with Phase 7, is what Phase 6's
+      entry deferred wiring for — both builders now exist, so
+      `op_nca_build_meta`/`op_nca_build_program` wrappers were added to
+      `switch-merge.sh` this same phase, replacing the last two bash
+      NCA-building call sites (`nca_build_meta`'s draft+final two-pass
+      calls, and the BKTR-reconstruction branch's `nca_build_program`
+      call).
+
+      **Verified end-to-end on the very first real test, byte-for-byte,
+      no fixup needed**: extracted a real title's actual exefs (6 files,
+      ~59MB total, including a real `main.npdm`) and romfs from its real
+      Program NCA (using this project's own already-verified
+      `decrypt-section`/`nca-section-info`/`pfs0-extract-all`/
+      `romfs-extract-all`), built a Program NCA from that real content
+      via both `build-program-nca` and `lib/nca_build.sh`'s own
+      `nca_build_program`, and `cmp`'d them — identical. Went one level
+      further than a bash-vs-C comparison again: extracted the BUILT
+      NCA with `nstool` and diffed every one of its 6 exefs files plus
+      its romfs directory structure against the ORIGINAL pre-build
+      content — 5 of 6 files matched byte-for-byte exactly, and
+      `main.npdm` differed in EXACTLY the deliberately-zeroed 512-byte
+      ACID signature/key region (bytes 128-639), confirmed to be
+      genuinely all-zero there and nowhere else. This is real
+      independent confirmation the built NCA is not just self-
+      consistent with this project's own two implementations of itself,
+      but genuinely correct, readable content by a real external tool.
+
+      **This phase's own bug-avoidance win**: because Phase 6 (RomFs
+      writer) had already landed and been fully verified standalone,
+      this phase could call its logic in-process via a small refactor
+      (`romfs_build_impl`, with `cmd_romfs_build` reduced to a thin CLI
+      wrapper around it) rather than needing its own from-scratch romfs-
+      building code or a fork/subprocess round-trip to get the
+      UNPADDED-size return value this phase's IVFC header needs exactly
+      right (a value this project's own README already documents as a
+      real, confirmed bug-source if mixed up with the padded on-disk
+      size) — the phased approach paid off directly here, not just as a
+      general engineering principle.
+
+      Full real 1G1R merges — a plain titlekey-crypto NSP, a single-
+      title XCI, AND a two-title XCI (three separate titles, one of
+      which required no BKTR reconstruction and one which used the
+      default titlekey/ticket-carry path) — all produced byte-for-byte
+      identical output via the compiled and `--pure` paths, and matched
+      output captured from every earlier phase this session going back
+      to Phase 2 (zero drift across the whole port so far). **Total
+      measured speedup with the full builder pipeline compiled: 3.9s vs
+      43.0s for the same real XCI merge, ~11x** — up from Phase 5's 4x,
+      confirming the Meta-NCA-building path (hash-table construction,
+      two-pass digest rebuild) was itself a meaningful further cost the
+      earlier phases hadn't yet touched.
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0

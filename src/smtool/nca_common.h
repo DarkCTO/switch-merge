@@ -20,4 +20,12 @@ int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned cha
  * Returns 0 on success, nonzero on failure. */
 int nca_encrypt_header(const unsigned char *header, const char *keys_path, unsigned char *out);
 
+#include <stdint.h>
+
+/* romfs_build_impl <in_dir> <out_path> <*out_unpadded_size>
+ * The in-process (no subprocess) RomFs writer from Phase 6 - see
+ * romfs_build.c's own header comment for the full algorithm. Used
+ * directly by Phase 8's Program NCA assembly. */
+int romfs_build_impl(const char *in_dir, const char *out_path, uint64_t *out_unpadded_size);
+
 #endif

@@ -39,6 +39,7 @@ int cmd_nca_hierarchical_integrity_layer(int argc, char **argv);
 int cmd_romfs_build(int argc, char **argv);
 int cmd_build_cnmt(int argc, char **argv);
 int cmd_build_meta_nca(int argc, char **argv);
+int cmd_build_program_nca(int argc, char **argv);
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -71,7 +72,8 @@ int main(int argc, char **argv) {
             "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n"
             "  romfs-build <in_dir> <out_path>\n"
             "  build-cnmt <out_path> <application|addon> <title_id_hex> <title_version> <program_or_-> <control_or_-> <legal_or_-> <data_or_->\n"
-            "  build-meta-nca <out_nca> <title_id_hex> <title_version> --keys <keys_file> [--program <nca>] [--control <nca>] [--legal <nca>] [--data <nca>] [--digest <hex64>]\n");
+            "  build-meta-nca <out_nca> <title_id_hex> <title_version> --keys <keys_file> [--program <nca>] [--control <nca>] [--legal <nca>] [--data <nca>] [--digest <hex64>]\n"
+            "  build-program-nca <out_nca> <title_id_hex> --keys <keys_file> --romfs-dir <dir> --exefs <file> [--exefs <file> ...]\n");
         return 1;
     }
 
@@ -106,6 +108,7 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "romfs-build") == 0) return cmd_romfs_build(sargc, sargv);
     if (strcmp(sub, "build-cnmt") == 0) return cmd_build_cnmt(sargc, sargv);
     if (strcmp(sub, "build-meta-nca") == 0) return cmd_build_meta_nca(sargc, sargv);
+    if (strcmp(sub, "build-program-nca") == 0) return cmd_build_program_nca(sargc, sargv);
 
     fprintf(stderr, "smtool: unknown subcommand '%s'\n", sub);
     return 1;

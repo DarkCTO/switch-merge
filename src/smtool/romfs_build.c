@@ -188,13 +188,13 @@ static void le_put_u64(unsigned char *out, uint64_t v) {
     for (int i = 0; i < 8; i++) out[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
 }
 
-int cmd_romfs_build(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: smtool romfs-build <in_dir> <out_path>\n");
-        return 1;
-    }
-    const char *in_dir = argv[0];
-    const char *out_path = argv[1];
+/* romfs_build_impl <in_dir> <out_path> <*out_unpadded_size>
+ * The full implementation, callable in-process by other C code (e.g.
+ * nca_build.c's Program-NCA assembly, Phase 8) without a subprocess
+ * spawn - the CLI entry point cmd_romfs_build below is a thin wrapper
+ * that just prints *out_unpadded_size to stdout for the standalone
+ * subcommand contract. */
+int romfs_build_impl(const char *in_dir, const char *out_path, uint64_t *out_unpadded_size) {
 
     entry_list_t dirs, files;
     list_init(&dirs);
@@ -509,11 +509,11 @@ int cmd_romfs_build(int argc, char **argv) {
         fclose(append);
     }
 
-    /* Echo the UNPADDED size (before this final alignment step) - this
-     * is exactly hacpack's own romfs_build return value AND its
-     * *out_size param, which becomes the IVFC level_headers[5].hash_data_size
-     * field in the caller - NOT the padded on-disk file size. */
-    printf("%ld\n", total_size);
+    /* The UNPADDED size (before this final alignment step) is exactly
+     * hacpack's own romfs_build return value AND its *out_size param,
+     * which becomes the IVFC level_headers[5].hash_data_size field in
+     * the caller - NOT the padded on-disk file size. */
+    *out_unpadded_size = (uint64_t)total_size;
 
     free(dir_hash_table);
     free(file_hash_table);
@@ -523,5 +523,16 @@ int cmd_romfs_build(int argc, char **argv) {
     for (size_t i = 0; i < files.count; i++) { free(files.entries[i].path); free(files.entries[i].name); }
     free(dirs.entries);
     free(files.entries);
+    return 0;
+}
+
+int cmd_romfs_build(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: smtool romfs-build <in_dir> <out_path>\n");
+        return 1;
+    }
+    uint64_t unpadded_size;
+    if (romfs_build_impl(argv[0], argv[1], &unpadded_size) != 0) return 1;
+    printf("%llu\n", (unsigned long long)unpadded_size);
     return 0;
 }

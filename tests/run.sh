@@ -273,6 +273,23 @@ else
     echo "SKIP: build-cnmt/build-meta-nca tests (no $REAL_KEYS or control.nca fixture on this machine)"
 fi
 
+# build-program-nca is NOT covered by an automated fixture test here -
+# unlike every other subcommand in this file, its real inputs (a real
+# game's exefs files + romfs directory) run into tens of MB even for
+# the smallest real title checked during development, well past what's
+# reasonable to commit as a fixture (every other fixture in this
+# directory is bytes to a few hundred KB). It was verified manually
+# during Phase 8 development: byte-for-byte identical (cmp) against
+# lib/nca_build.sh's own nca_build_program on a real Program NCA's
+# real exefs (6 files, ~59MB total)/romfs, AND independently confirmed
+# correct by extracting the built NCA with nstool and diffing every
+# extracted file against the original (all 5 non-npdm exefs files
+# matched exactly; main.npdm differed only in the deliberately-zeroed
+# 512-byte ACID signature/key region). If revisiting this code, re-run
+# that same manual verification against a real title rather than
+# trusting this comment alone - see README's Phase 8 roadmap entry for
+# the exact commands used.
+
 # --- decrypt-section / nca-hierarchical-*-layer ---
 if [ -f "$REAL_KEYS" ]; then
     control_nca_full="$FIXTURES/control.nca"

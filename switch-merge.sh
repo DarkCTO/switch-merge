@@ -344,6 +344,46 @@ op_romfs_extract_all() {
     fi
 }
 
+# op_nca_build_meta <out_nca> <title_id_hex> <title_version_decimal>
+#   <program_nca_or_empty> <control_nca_or_empty> <legal_nca_or_empty>
+#   <data_nca_or_empty> <digest_hex_or_empty>
+# Same contract as nca_build_meta (lib/nca_build.sh) - builds a complete
+# Meta NCA. Pass empty string for any NCA path that isn't present, and
+# empty digest_hex for the first (draft) pass.
+op_nca_build_meta() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_build_meta "$1" "$KEYS" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    else
+        local -a smtool_args=("$1" "$2" "$3" --keys "$KEYS")
+        [ -n "$4" ] && smtool_args+=(--program "$4")
+        [ -n "$5" ] && smtool_args+=(--control "$5")
+        [ -n "$6" ] && smtool_args+=(--legal "$6")
+        [ -n "$7" ] && smtool_args+=(--data "$7")
+        [ -n "$8" ] && smtool_args+=(--digest "$8")
+        "$SMTOOL" build-meta-nca "${smtool_args[@]}"
+    fi
+}
+
+# op_nca_build_program <out_nca> <title_id_hex> <exefs_files_array_name> <romfs_dir>
+# Same contract as nca_build_program (lib/nca_build.sh) - exefs_files_array_name
+# is the NAME of an already-populated bash array variable (nameref, same
+# convention nca_build_program itself uses), in the exefs' own original
+# container order.
+op_nca_build_program() {
+    local out_nca="$1" title_id_hex="$2" exefs_array_name="$3" romfs_dir="$4"
+    if [ "$PURE" -eq 1 ]; then
+        nca_build_program "$out_nca" "$KEYS" "$title_id_hex" "$exefs_array_name" "$romfs_dir"
+    else
+        local -n _exefs_files_ref="$exefs_array_name"
+        local -a smtool_args=("$out_nca" "$title_id_hex" --keys "$KEYS" --romfs-dir "$romfs_dir")
+        local f
+        for f in "${_exefs_files_ref[@]}"; do
+            smtool_args+=(--exefs "$f")
+        done
+        "$SMTOOL" build-program-nca "${smtool_args[@]}"
+    fi
+}
+
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
 # NCA/tik/cert files - the pure-bash replacement for `nstool -x <out_dir>
@@ -911,7 +951,7 @@ merge_group() {
 
         echo "==> [$title_id] Rebuilding standalone (non-titlekey) Program NCA from reconstructed content"
         local REBUILT_PROGRAM_NCA="$GROUP_WORK/rebuilt_program.nca"
-        nca_build_program "$REBUILT_PROGRAM_NCA" "$KEYS" "$BASE_TITLE_ID" EXEFS_FILES "$RECON_ROMFS" || exit 1
+        op_nca_build_program "$REBUILT_PROGRAM_NCA" "$BASE_TITLE_ID" EXEFS_FILES "$RECON_ROMFS" || exit 1
 
         local REBUILT_PROGRAM_ID
         REBUILT_PROGRAM_ID="$(_nca_build_content_id_from_nca "$REBUILT_PROGRAM_NCA")"
@@ -948,7 +988,7 @@ merge_group() {
     # placeholder digest, hash the resulting cnmt body, then rebuild
     # passing the real digest. See README's "The debugging story".
     local DRAFT_META_NCA="$GROUP_WORK/draft_meta.nca"
-    nca_build_meta "$DRAFT_META_NCA" "$KEYS" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "" || exit 1
+    op_nca_build_meta "$DRAFT_META_NCA" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "" || exit 1
 
     local DRAFT_CNMT_FILE="$GROUP_WORK/draft.cnmt"
     extract_cnmt_from_meta_nca "$DRAFT_META_NCA" "$DRAFT_CNMT_FILE" || exit 1
@@ -959,7 +999,7 @@ merge_group() {
     DIGEST="$(head -c "$((CNMT_SIZE - 32))" "$DRAFT_CNMT_FILE" | sha256sum | cut -d' ' -f1)"
 
     local FINAL_META_NCA="$GROUP_WORK/final_meta.nca"
-    nca_build_meta "$FINAL_META_NCA" "$KEYS" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "$DIGEST" || exit 1
+    op_nca_build_meta "$FINAL_META_NCA" "$BASE_TITLE_ID" "$VERSION_DEC" "$PROGRAM_PATH" "$CONTROL_NCA_PATH" "$LEGAL_NCA_PATH" "" "$DIGEST" || exit 1
     local FINAL_META_ID
     FINAL_META_ID="$(_nca_build_content_id_from_nca "$FINAL_META_NCA")"
     cp "$FINAL_META_NCA" "$MERGE_DIR/${FINAL_META_ID}.cnmt.nca"
