@@ -608,7 +608,8 @@ file back with a clean, correct file tree. See `lib/pfs0.sh`.
    NCA unmodified.
    1. Extract the base NSP's own Program NCA + ticket independently (not
       just the primary source), plus both sides' raw ticket-encrypted
-      titlekeys (`nstool -t tik -v`, the `Title Key: Data:` field).
+      titlekeys via `parse_tik` (`lib/binfmt.sh`, pure bash, no `nstool`
+      call).
    2. `hactool --titlekey=<base_key> --plaintext=<file> <base_program.nca>`
       — decrypt the base Program NCA to a plaintext copy, so it can be used
       as a `--basenca` reference without a second key context.
@@ -750,7 +751,7 @@ above.
 | NSC_Builder | Does the real job, but Windows-first, archived, GUI-oriented. The reason this project exists. |
 | `nsz` | Compress/decompress only (NSP↔NSZ, XCI↔XCZ). Not a content merger. |
 | `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta`/`--ncatype program` + `--ncadir` modes are exactly what's needed for building NCAs — see above. Its flat `--type nsp` container-packing role has since been replaced by this project's own `lib/pfs0.sh` (no crypto/hashing involved in that format, low risk to reimplement — see "The debugging story"), but `hacpack` is still used for the actual NCA-building steps (Meta, Program), which do involve encryption/hash-tree construction. |
-| `nstool` | Read/extract/verify only, no repack — used for the NCA/NSP extraction half of the pipeline (decrypting per-title content, which needs real key derivation this project deliberately hasn't reimplemented). Its own `--basenca` support turned out to need both sides' tickets simultaneously, which its single `--tik`/`--cert` flag pair can't express for base+update with different Rights IDs — `hactool` was used instead for the BKTR reconstruction step, since its `--titlekey=<raw>` + `--basenca=<plaintext nca>` combination doesn't have that limitation. cnmt/NACP field reading and NCA-header `RightsId` reading no longer use `nstool` at all — see `lib/binfmt.sh`/`lib/nca_header.sh`. |
+| `nstool` | Read/extract/verify only, no repack — used for the NCA/NSP extraction half of the pipeline (decrypting per-title content, which needs real key derivation this project deliberately hasn't reimplemented). Its own `--basenca` support turned out to need both sides' tickets simultaneously, which its single `--tik`/`--cert` flag pair can't express for base+update with different Rights IDs — `hactool` was used instead for the BKTR reconstruction step, since its `--titlekey=<raw>` + `--basenca=<plaintext nca>` combination doesn't have that limitation. cnmt/NACP field reading, NCA-header `RightsId` reading, and ticket (`.tik`) titlekey reading no longer use `nstool` at all — see `lib/binfmt.sh`/`lib/nca_header.sh`. |
 | `hactool` | Chosen for BKTR delta reconstruction (`--basenca` against a plaintext-decrypted base Program NCA) — see "The debugging story". Also used to decrypt a titlekey-crypto NCA to plaintext (`--plaintext=<file>`) as a prerequisite for that. Upstream 1.4.0 has a real, confirmed BKTR layout-validation bug (Bug #3) — this project vendors a locally-patched build in `bin/` rather than the stock release. |
 | `DarkMatterCore/nxdumptool` | Not used as a dependency, but its source was consulted directly to confirm hactool's BKTR checks are unnecessary (see Bug #3) — it successfully reads BKTR patch romfs with no equivalent pre-validation at all. |
 | `switch-merge-utility` (Rust, LordZeuss) | GUI-only, no documented CLI mode. |
@@ -845,6 +846,25 @@ above.
       materially higher risk tier (a subtly wrong implementation would
       silently produce corrupted game/save data, not a clean error) and
       were deliberately not attempted without discussing that risk first.
+- [x] Reduce dependency on vendored tools, third piece — implemented:
+      `lib/binfmt.sh` gained `parse_tik`, a pure-bash parser for the
+      ticket (`.tik`) format that reads the raw, still ticket-encrypted
+      titlekey (what `hactool --titlekey=` wants) directly from its fixed
+      offset (`0x180`, 16 bytes, for the RSA-2048-SHA256 SignType every
+      real console ticket seen so far uses), replacing the
+      `nstool -t tik -v | grep -A4 "Title Key" | grep -oP ...` text-scrape
+      in the BKTR-reconstruction code path. Also reads `RightsId` (`0x2A0`)
+      for completeness, though the script still gets `RightsId` from the
+      NCA header (`lib/nca_header.sh`) as the authoritative source.
+      Verified byte-for-byte against `nstool -t tik -v`'s own `Data:` and
+      `RightsId:` output on real extracted tickets (both the base's and
+      the update's, different Rights IDs), and by re-running the full
+      Dicefolk base+update+DLC merge end-to-end and confirming the output
+      NSP is byte-for-byte identical (`cmp`) to the previously-verified,
+      hardware-tested output. **`nstool` is still used** for full NSP/NCA
+      container extraction (`-x`, `-t nca -x`) and everything involving
+      per-title AES-CTR decryption/hash-tree verification — reimplementing
+      that remains the same higher-risk tier described above.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**

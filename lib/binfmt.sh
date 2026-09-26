@@ -176,3 +176,39 @@ parse_nacp() {
     NACP_NAME="$(hex_to_text "$(hex_field_raw "$hex" 0 512)")"
     NACP_DISPLAY_VERSION="$(hex_to_text "$(hex_field_raw "$hex" 12384 16)")"
 }
+
+# parse_tik <path to .tik file>
+# Sets TIK_TITLEKEY: the raw, still ticket-encrypted titlekey as a lowercase
+# hex string (32 hex chars / 16 bytes) - exactly the value hactool's
+# --titlekey= wants, and what nstool -t tik -v prints under "Title Key: Data:".
+# NOT the fully-decrypted AES-CTR content key nstool prints elsewhere.
+#
+# Also sets TIK_RIGHTS_ID (16 bytes, raw hex) for anyone who wants it, though
+# switch-merge.sh currently gets RightsId from the NCA header instead
+# (lib/nca_header.sh) since that's the authoritative source.
+#
+# Layout reference (switchbrew.org/wiki/Ticket) for the common RSA-2048-SHA256
+# signature type (SignType 0x10004, the only kind seen on real console
+# tickets so far - a different SignType shifts every offset below, since the
+# signature block size varies per type):
+#   0x000 (0x4)  SignType
+#   0x140 (0x40) Issuer
+#   0x180 (0x10) TitleKeyBlock (first 16 bytes = the titlekey, EncMode-dependent)
+#   0x2A0 (0x10) RightsId
+# Verified byte-for-byte against nstool -t tik -v's own "Title Key: Data:"
+# and "RightsId:" output on a real extracted ticket.
+parse_tik() {
+    local path="$1"
+    local hex
+    hex="$(hex_of_file "$path")"
+
+    local sign_type
+    sign_type="$(int_of_hex "$(hex_field_le "$hex" 0 4)")"
+    if [ "$sign_type" -ne 65540 ]; then
+        echo "parse_tik: unsupported SignType $sign_type (only RSA2048-SHA256/0x10004 handled)" >&2
+        return 1
+    fi
+
+    TIK_TITLEKEY="$(hex_field_raw "$hex" 384 16)"
+    TIK_RIGHTS_ID="$(hex_field_raw "$hex" 672 16)"
+}

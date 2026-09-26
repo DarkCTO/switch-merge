@@ -45,13 +45,14 @@ per group, failures in one group don't stop the others.
 vendored in `bin/`, which the script puts first on `PATH` automatically.
 No system package install needed, and `bin/hactool` specifically carries a
 local fix for a real upstream bug (see below) that the system/AUR version
-doesn't have. **cnmt/NACP parsing, NCA-header `RightsId` reading, and
-NSP/PFS0 packing no longer use `nstool`/`hacpack` at all** — `lib/binfmt.sh`
-reads cnmt/NACP directly in pure bash, `lib/nca_header.sh` decrypts just
-the NCA header (AES-XTS, built from raw `openssl enc -aes-128-ecb` since
-`openssl enc` has no XTS mode of its own) to read `RightsId`, and
-`lib/pfs0.sh` packs the final NSP container, verified byte-for-byte
-identical to a real `hacpack`-produced NSP via `cmp`. Everything involving
+doesn't have. **cnmt/NACP parsing, NCA-header `RightsId` reading, ticket
+titlekey reading, and NSP/PFS0 packing no longer use `nstool`/`hacpack` at
+all** — `lib/binfmt.sh` reads cnmt/NACP/`.tik` directly in pure bash,
+`lib/nca_header.sh` decrypts just the NCA header (AES-XTS, built from raw
+`openssl enc -aes-128-ecb` since `openssl enc` has no XTS mode of its own)
+to read `RightsId`, and `lib/pfs0.sh` packs the final NSP container,
+verified byte-for-byte identical to a real `hacpack`-produced NSP via
+`cmp`. Everything involving
 actual NCA content-partition decryption/extraction, NCA *building*
 (Meta/Program — which needs to write hash trees, not just read them), and
 BKTR reconstruction still goes through the vendored tools —
@@ -83,9 +84,10 @@ actually wrong with them.
   different-RightsId sides at once (base + update tickets) — that's why
   `hactool` was added as a second dependency, specifically for the BKTR
   reconstruction step. `hactool --titlekey` wants the raw ticket-encrypted
-  key value (`nstool -t tik -v` → `Title Key: Data:` field), not the
-  fully-decrypted "AES-CTR Key" nstool prints in its own verbose NCA dump —
-  easy to mix these up.
+  key value — read directly from the ticket's fixed `0x180` offset by this
+  project's own `parse_tik` (`lib/binfmt.sh`), not the fully-decrypted
+  "AES-CTR Key" nstool prints in its own verbose NCA dump — easy to mix
+  these up.
 - **DLC does not get folded into the base Meta NCA at all.** It's a
   structurally separate title (`AddOnContent`) that just references the
   base's title ID. "Merging" DLC means carrying its own Meta + Data NCA(s)

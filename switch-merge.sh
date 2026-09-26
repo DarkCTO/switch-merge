@@ -294,7 +294,8 @@ merge_group() {
         BASE_PROGRAM_NCA_ID="$CNMT_PROGRAM_ID"
         BASE_PROGRAM_SRC="$(find "$BASE_DIR" -maxdepth 1 -iname "${BASE_PROGRAM_NCA_ID}.nca" | head -n1)"
 
-        # Pull each side's raw (still ticket-encrypted) titlekey. This is
+        # Pull each side's raw (still ticket-encrypted) titlekey via
+        # parse_tik (lib/binfmt.sh, pure bash, no nstool call). This is
         # the value hactool's --titlekey wants - not the same as the
         # fully-decrypted AES-CTR content key nstool prints in its own
         # verbose NCA dump.
@@ -304,7 +305,8 @@ merge_group() {
             local tik
             tik="$(find "$dir" -maxdepth 1 -iname '*.tik' | head -n1)"
             [ -n "$tik" ] || { echo "[$title_id] No ticket found in $dir" >&2; exit 1; }
-            nstool -t tik -v "$tik" 2>/dev/null | grep -A4 "Title Key" | grep -oP '^\s+\K[0-9A-Fa-f]{32}$'
+            parse_tik "$tik"
+            echo "$TIK_TITLEKEY"
         }
         local BASE_TITLEKEY UPDATE_TITLEKEY
         BASE_TITLEKEY="$(extract_ticket_titlekey "$BASE_DIR")"
