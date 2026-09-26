@@ -18,6 +18,9 @@ document assumes it. If you just want to use the tool, skip to "Usage".
 
 - Linux x86-64 (any reasonably modern distro — the vendored binaries below
   only link against glibc/libstdc++/libgcc, no distro-specific dependencies).
+- `xxd` (ships with `vim`/`vim-common` on most distros, but isn't always
+  preinstalled on a minimal system) — used by `lib/binfmt.sh` for pure-bash
+  binary parsing, see below.
 - Your console's `prod.keys` at `~/.switch/prod.keys` (standard Lockpick_RCM
   output location).
 
@@ -141,6 +144,15 @@ save data. Every NCA has a `Content Type`, which tells you what's inside:
   small binary blob holding the game's display name, publisher, and
   human-readable version string (`DisplayVersion`, e.g. `"1.2.12"`) per
   language. This is genuinely tiny — under 2 MB — compared to Program.
+  Fixed-size, 0x4000 (16384) bytes total. Byte layout used by this
+  project's `lib/binfmt.sh` (verified against real files):
+  ```
+  16 language slots, 0x300 (768) bytes each, starting at file offset 0:
+    slot 0 = AmericanEnglish (the one this project reads)
+    0x000 (0x200 bytes) Name, NUL-padded
+    0x200 (0x100 bytes) Publisher, NUL-padded
+  0x3060 (0x10 bytes) DisplayVersion, NUL-padded, e.g. "1.2.12"
+  ```
 - **`LegalInformation`** (a.k.a. `Manual`) — the legal/manual HTML content
   you get to when you long-press the game icon on a real console. Also
   tiny.
@@ -176,7 +188,32 @@ hash, plus:
   this digest right, rather than leaving it zeroed, was one of two things
   that broke early merge attempts — see "The debugging story".)
 
-Read one with `nstool -t cnmt -v some.cnmt`.
+Read one with `nstool -t cnmt -v some.cnmt`, or with `parse_cnmt` from this
+project's own `lib/binfmt.sh` — the exact byte layout (verified against
+real files from this project, cross-checked against `nstool`'s own output):
+
+```
+PackagedContentMetaHeader (0x20 bytes, at file start):
+  0x00  u64  Id                    <- this content's own TitleId
+  0x08  u32  Version
+  0x0C  u8   ContentMetaType       <- 0x80 Application, 0x81 Patch, 0x82 AddOnContent
+  0x0E  u16  ExtendedHeaderSize
+  0x10  u16  ContentCount
+
+ApplicationMetaExtendedHeader (Application only, right after the header):
+  0x00  u64  PatchId               <- points forward to this title's update
+
+PatchMetaExtendedHeader (Patch/AddOnContent, right after the header):
+  0x00  u64  ApplicationId         <- the base title ID (see below)
+
+PackagedContentInfo (0x38 bytes each, repeated ContentCount times,
+starting right after the extended header):
+  0x20  u128 ContentId             <- raw bytes, this is the NCA's filename
+  0x30  u40  Size                  <- little-endian, non-power-of-2 width
+  0x36  u8   ContentType           <- 1 Program, 3 Control, 5 LegalInformation, 2 Data
+
+Digest: last 32 bytes of the file, SHA256 over everything before it.
+```
 
 ### Application, Patch, AddOnContent: the three title kinds
 
@@ -446,25 +483,26 @@ changes.
 0. Expand any directory inputs to the `.nsp` files directly inside them,
    then classify every resulting NSP: extract just its Meta NCA (via
    `nstool --fstree`'s virtual-path listing, so the whole NSP doesn't need
-   extracting) and read the cnmt's content-meta `Type` with
-   `nstool -t cnmt -v`. `Application` → base, `Patch` → update,
-   `AddOnContent` → DLC. Also read the **base title ID** this content
-   belongs to from the same cnmt dump (`TitleId` directly for an
-   `Application`; `ApplicationId` for `Patch`/`AddOnContent` — see "The
-   three title kinds" above), and group all classified inputs by that
-   title ID. Steps 1–9 below then run **once per title group** — a
-   directory with several different games mixed together produces one
-   output NSP per game. A group with no `Application` NSP is skipped (with
-   a clear error) rather than aborting the whole run; a group with more
-   than one `Application` or `Patch` NSP keeps the first and warns about
-   (skips) the rest.
+   extracting) and read the cnmt's content-meta `Type` with this project's
+   own `parse_cnmt` (`lib/binfmt.sh`) — no `nstool` call for the cnmt
+   itself. `Application` → base, `Patch` → update, `AddOnContent` → DLC.
+   Also read the **base title ID** this content belongs to from the same
+   parse (`TitleId` directly for an `Application`; `ApplicationId` for
+   `Patch`/`AddOnContent` — see "The three title kinds" above), and group
+   all classified inputs by that title ID. Steps 1–9 below then run
+   **once per title group** — a directory with several different games
+   mixed together produces one output NSP per game. A group with no
+   `Application` NSP is skipped (with a clear error) rather than aborting
+   the whole run; a group with more than one `Application` or `Patch` NSP
+   keeps the first and warns about (skips) the rest.
 1. Pick the **primary source**: the update NSP if one was found, else the
    base NSP. `nstool -x` — extract its NCAs to a scratch dir.
 2. `nstool -t nca -x` — extract the primary source's Meta NCA to get the
    raw `.cnmt`.
-3. `nstool -t cnmt -v` — parse the cnmt for the base title ID (`TitleId`
-   if primary is the base, `ApplicationId` if primary is the update),
-   `Version`, and the NCA IDs for `Program`/`Control`/`LegalInformation`.
+3. `parse_cnmt` (`lib/binfmt.sh`, pure bash, no `nstool` call) — parse the
+   cnmt for the base title ID (`TitleId` if primary is the base,
+   `ApplicationId` if primary is the update), `Version`, and the NCA IDs
+   for `Program`/`Control`/`LegalInformation`.
 4. `nstool -t nca -v` on the primary source's Program NCA — check for a
    `RightsId`. If one is present **and** an update was found, branch into
    the BKTR reconstruction path (steps 4a–4d); otherwise skip straight to
@@ -507,10 +545,10 @@ changes.
    everything (the new Meta NCA, the Program NCA from step 4,
    Control/LegalInformation NCAs, any tickets/certs, and each DLC's own
    Meta + Data NCAs) into one NSP.
-9. `nstool -x` the merged Control NCA and `nstool -t nacp -v` its
-   `control.nacp` to read the game's display `Name` and `DisplayVersion`,
-   then rename the packed NSP to
-   `<Name> [<TitleId>][<DisplayVersion>][<DLC count>].nsp`.
+9. `nstool -x` the merged Control NCA, then `parse_nacp` (`lib/binfmt.sh`,
+   pure bash, no `nstool` call) on the resulting `control.nacp` to read the
+   game's display `Name` and `DisplayVersion`, then rename the packed NSP
+   to `<Name> [<TitleId>][<DisplayVersion>][<DLC count>].nsp`.
 
 Each title group's steps 1–9 run inside a subshell, so a hard failure in
 one group doesn't stop the others — the group is recorded as failed and
@@ -656,6 +694,28 @@ above.
       cwd) and defaults `-o` to `merged/` next to it, so dropping files
       alongside the script and running `./switch-merge.sh` with no
       arguments just works.
+- [x] Reduce dependency on vendored tools, starting with the easiest piece
+      — implemented: `lib/binfmt.sh` is a pure-bash (no external binary)
+      parser for cnmt (`PackagedContentMeta`) and NACP (`control.nacp`),
+      the two small, well-documented binary formats the script needs to
+      read fields from (title ID, content-meta type, version,
+      Program/Control/LegalInformation content IDs, display name,
+      display version). Replaces the four call sites that used to
+      text-scrape `nstool -t cnmt -v` / `nstool -t nacp -v`'s human-
+      readable dump with `grep -oP`. Verified against every real cnmt
+      shape this project has seen (Application/Patch/AddOnContent) and
+      real NACP files, byte-for-byte matching `nstool`'s own output — see
+      "Switch content format, from scratch" and "The debugging story"
+      below for the format details and verification approach.
+      **`nstool` is still used** for everything involving NCA container
+      extraction/decryption (AES-CTR/titlekey crypto, hash-tree
+      verification) — reimplementing *that* from scratch risks silently
+      corrupted output on a subtle bug, which isn't worth it for tooling
+      that already works and is already open-source
+      (jakcron/nstool, MIT-ish license) and locally patchable if needed
+      (as already done for `hactool`'s BKTR bug). `hacpack`/`hactool`
+      remain fully in use for NCA/NSP packing and BKTR reconstruction, for
+      the same reason.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**

@@ -32,6 +32,18 @@ if [ -d "$SCRIPT_DIR/bin" ]; then
     PATH="$SCRIPT_DIR/bin:$PATH"
 fi
 
+# Pure-bash cnmt/NACP binary parsers (lib/binfmt.sh) - no external tool
+# dependency for reading these two small, well-documented formats. See
+# README's "The debugging story" for how these were derived and verified
+# against nstool's own output on real files. Everything else (NCA
+# decrypt/extract, NSP/NCA packing, BKTR reconstruction) still goes through
+# the vendored nstool/hacpack/hactool, since those involve AES-CTR/titlekey
+# crypto, hash-tree verification, and BKTR bucket-tree parsing where a
+# subtly wrong from-scratch implementation would silently produce corrupted
+# output rather than a clean error - not worth that risk for what's already
+# working, tested, patched-where-needed tooling.
+source "$SCRIPT_DIR/lib/binfmt.sh"
+
 KEYS="$HOME/.switch/prod.keys"
 OUT_DIR="$SCRIPT_DIR/merged"
 INPUTS=()
@@ -58,6 +70,7 @@ done
 command -v nstool >/dev/null || { echo "nstool not found in PATH" >&2; exit 1; }
 command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }
 command -v hactool >/dev/null || { echo "hactool not found in PATH" >&2; exit 1; }
+command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
 
 # Expand any directory inputs to the *.nsp files directly inside them
 # (non-recursive), and pass individual file inputs through unchanged.
@@ -81,18 +94,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$OUT_DIR"
 
-# Parses a cnmt (given verbose `nstool -t cnmt -v` output) and echoes the NCA
-# id for the first ContentInfo entry of the given type (Program, Control,
-# LegalInformation, Data, ...), or nothing if absent.
-find_content_id() {
-    local cnmt_info="$1" type="$2"
-    echo "$cnmt_info" | grep -A2 "Type:.*${type}" | grep -oP 'Id:\s*\K[0-9a-fA-F]+' | head -n1
-}
-
 # Classifies an NSP by its cnmt content-meta Type (Application/Patch/
 # AddOnContent) and its base title ID, without extracting the whole file -
 # just the Meta NCA (found via --fstree's virtual path listing) and its
-# cnmt payload. Echoes "<Type> <base_title_id>" on success.
+# cnmt payload, parsed directly via lib/binfmt.sh's parse_cnmt (no nstool
+# call for the cnmt itself). Echoes "<Type> <base_title_id>" on success.
 #
 # The two non-Application cnmt shapes name the "base title ID" field
 # differently from Application's own TitleId - see README's "Switch
@@ -103,7 +109,7 @@ find_content_id() {
 classify_nsp() {
     local nsp="$1"
     local tag="$2"
-    local meta_name meta_nca cnmt_dir cnmt_file cnmt_info nsp_type base_id
+    local meta_name meta_nca cnmt_dir cnmt_file base_id
     meta_name="$(nstool -k "$KEYS" --fstree "$nsp" 2>/dev/null | grep -oP '[0-9a-fA-F]+\.cnmt\.nca' | head -n1)"
     [ -n "$meta_name" ] || { echo "Could not find Meta NCA in $nsp" >&2; return 1; }
 
@@ -116,18 +122,17 @@ classify_nsp() {
     cnmt_file="$(find "$cnmt_dir" -name '*.cnmt' | head -n1)"
     [ -n "$cnmt_file" ] || { echo "Could not find .cnmt inside Meta NCA of $nsp" >&2; return 1; }
 
-    cnmt_info="$(nstool -k "$KEYS" -t cnmt -v "$cnmt_file" 2>/dev/null)"
-    nsp_type="$(echo "$cnmt_info" | grep -m1 -oP 'Type:\s*\K\S+')"
-    [ -n "$nsp_type" ] || { echo "Could not determine content-meta type of $nsp" >&2; return 1; }
+    parse_cnmt "$cnmt_file"
+    [ -n "$CNMT_TYPE_NAME" ] || { echo "Could not determine content-meta type of $nsp" >&2; return 1; }
 
-    if [ "$nsp_type" = "Application" ]; then
-        base_id="$(echo "$cnmt_info" | grep -oP 'TitleId:\s*0x\K[0-9a-fA-F]+' | head -n1)"
+    if [ "$CNMT_TYPE_NAME" = "Application" ]; then
+        base_id="$CNMT_TITLE_ID"
     else
-        base_id="$(echo "$cnmt_info" | grep -oP 'ApplicationId:\s*0x\K[0-9a-fA-F]+' | head -n1)"
+        base_id="$CNMT_APPLICATION_ID"
     fi
     [ -n "$base_id" ] || { echo "Could not determine base title id of $nsp" >&2; return 1; }
 
-    echo "$nsp_type $base_id"
+    echo "$CNMT_TYPE_NAME $base_id"
 }
 
 echo "==> Classifying ${#CANDIDATE_NSPS[@]} input NSP(s)"
@@ -232,26 +237,21 @@ merge_group() {
     CNMT_FILE="$(find "$CNMT_DIR" -name '*.cnmt' | head -n1)"
     [ -n "$CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside $PRIMARY_LABEL Meta NCA" >&2; exit 1; }
 
-    local CNMT_INFO
-    CNMT_INFO="$(nstool -k "$KEYS" -t cnmt -v "$CNMT_FILE")"
+    parse_cnmt "$CNMT_FILE"
 
     local BASE_TITLE_ID
     if [ -n "$UPDATE_NSP" ]; then
-        BASE_TITLE_ID="$(echo "$CNMT_INFO" | grep -oP 'ApplicationId:\s*0x\K[0-9a-fA-F]+')"
+        BASE_TITLE_ID="$CNMT_APPLICATION_ID"
     else
-        BASE_TITLE_ID="$(echo "$CNMT_INFO" | grep -oP 'TitleId:\s*0x\K[0-9a-fA-F]+' | head -n1)"
+        BASE_TITLE_ID="$CNMT_TITLE_ID"
     fi
-    local VERSION_DEC
-    VERSION_DEC="$(echo "$CNMT_INFO" | grep -oP 'Version:.*\(v\K[0-9]+(?=\))' | head -n1)"
+    local VERSION_DEC="$CNMT_VERSION"
     [ -n "$BASE_TITLE_ID" ] || { echo "[$title_id] Could not determine base title id from $PRIMARY_LABEL cnmt" >&2; exit 1; }
     [ -n "$VERSION_DEC" ] || { echo "[$title_id] Could not determine title version from $PRIMARY_LABEL cnmt" >&2; exit 1; }
     local VERSION_HEX
     VERSION_HEX="$(printf '%08x' "$VERSION_DEC")"
 
-    local PROGRAM_NCA CONTROL_NCA LEGAL_NCA
-    PROGRAM_NCA="$(find_content_id "$CNMT_INFO" Program)"
-    CONTROL_NCA="$(find_content_id "$CNMT_INFO" Control)"
-    LEGAL_NCA="$(find_content_id "$CNMT_INFO" LegalInformation)"
+    local PROGRAM_NCA="$CNMT_PROGRAM_ID" CONTROL_NCA="$CNMT_CONTROL_ID" LEGAL_NCA="$CNMT_LEGALINFORMATION_ID"
 
     [ -n "$PROGRAM_NCA" ] || { echo "[$title_id] $PRIMARY_LABEL cnmt has no Program content" >&2; exit 1; }
 
@@ -275,14 +275,14 @@ merge_group() {
         mkdir -p "$BASE_DIR"
         nstool -k "$KEYS" -x "$BASE_DIR" "$BASE_NSP" >/dev/null
 
-        local BASE_CNMT_NCA BASE_CNMT_EXTRACT_DIR BASE_CNMT_FILE BASE_CNMT_INFO BASE_PROGRAM_NCA_ID BASE_PROGRAM_SRC
+        local BASE_CNMT_NCA BASE_CNMT_EXTRACT_DIR BASE_CNMT_FILE BASE_PROGRAM_NCA_ID BASE_PROGRAM_SRC
         BASE_CNMT_NCA="$(find "$BASE_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
         BASE_CNMT_EXTRACT_DIR="$GROUP_WORK/base_cnmt_extract"
         mkdir -p "$BASE_CNMT_EXTRACT_DIR"
         nstool -k "$KEYS" -t nca -x "$BASE_CNMT_EXTRACT_DIR" "$BASE_CNMT_NCA" >/dev/null
         BASE_CNMT_FILE="$(find "$BASE_CNMT_EXTRACT_DIR" -name '*.cnmt' | head -n1)"
-        BASE_CNMT_INFO="$(nstool -k "$KEYS" -t cnmt -v "$BASE_CNMT_FILE")"
-        BASE_PROGRAM_NCA_ID="$(find_content_id "$BASE_CNMT_INFO" Program)"
+        parse_cnmt "$BASE_CNMT_FILE"
+        BASE_PROGRAM_NCA_ID="$CNMT_PROGRAM_ID"
         BASE_PROGRAM_SRC="$(find "$BASE_DIR" -maxdepth 1 -iname "${BASE_PROGRAM_NCA_ID}.nca" | head -n1)"
 
         # Pull each side's raw (still ticket-encrypted) titlekey. This is
@@ -451,10 +451,9 @@ merge_group() {
 
         local GAME_NAME="" DISPLAY_VERSION=""
         if [ -n "$NACP_FILE" ]; then
-            local NACP_INFO
-            NACP_INFO="$(nstool -t nacp -v "$NACP_FILE" 2>/dev/null)"
-            GAME_NAME="$(echo "$NACP_INFO" | grep -m1 -oP 'Name:\s*\K.+' | sed 's/[[:space:]]*$//')"
-            DISPLAY_VERSION="$(echo "$NACP_INFO" | grep -oP 'DisplayVersion:\s*\K\S+' | head -n1)"
+            parse_nacp "$NACP_FILE"
+            GAME_NAME="$NACP_NAME"
+            DISPLAY_VERSION="$NACP_DISPLAY_VERSION"
         fi
 
         if [ -n "$GAME_NAME" ] && [ -n "$DISPLAY_VERSION" ]; then
