@@ -10,6 +10,14 @@
 # hacpack's own auto-generated build-cache backups.
 /hacpack_backup/
 
+# Project-local scratch dir (switch-merge.sh sets TMPDIR here so mktemp
+# calls stay off system /tmp) - always cleaned up on exit, but ignore it
+# in case a run gets killed before its own trap fires.
+/tmp/
+
+# Test game files kept out of the project root for tidiness.
+/roms/
+
 # Keys - never commit these under any circumstances.
 *.keys
 prod.keys*

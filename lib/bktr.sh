@@ -138,11 +138,35 @@ bktr_read_subsection_table() {
 # relocation_header/subsection_header num_entries - see bktr_headers'
 # caller for where those get cross-checked):
 #   Block header (0x10 bytes): u32 _0x0; u32 num_buckets; u64 total_size
-#   bucket_virtual_offsets[0x3FF0/8] (0x3FF0 bytes) - not read (single
-#   bucket only)
-#   Bucket 0 starts at 0x10 + 0x3FF0 = 0x4000:
+#   bucket_virtual_offsets[0x3FF0/8] (0x3FF0 bytes, i.e. up to 2046 u64
+#   entries) - this array is ALWAYS this fixed 0x3FF0-byte size on disk
+#   regardless of num_buckets (hactool's own bktr_relocation_block_t
+#   struct declares it as a fixed-size array, not sized to num_buckets),
+#   so bucket 0 always starts at file offset 0x10+0x3FF0=0x4000 no matter
+#   how many buckets exist - only the CONTENTS of this array (how many of
+#   the 2046 slots hold a real offset vs padding) depend on num_buckets.
+#   Buckets themselves are back-to-back after that, each at a FIXED
+#   stride of 0x4000 bytes - confirmed directly from hactool's own
+#   bktr_relocation_bucket_t: header (0x10) + entries[0x3FF0/20] (818
+#   entries of 20 bytes = 16360 bytes) + padding[0x3FF0 % 20] (8 bytes)
+#   = 0x10 + 16360 + 8 = 0x4000 exactly. There is no extra "overflow"
+#   entry - an earlier version of this comment claimed a 0x4014 stride
+#   (0x4000 + one entry), which was wrong and caused reads to run past
+#   the end of a real multi-bucket (num_buckets=29) table's file:
 #     Bucket header (0x10 bytes): u32 _0x0; u32 num_entries; u64 virtual_offset_end
 #     entries[] (0x14 bytes each): u64 virt_offset; u64 phys_offset; u32 is_patch
+#
+# Bucket SELECTION for a real, multi-bucket table (num_buckets > 1) walks
+# bucket_virtual_offsets the same simple way hactool's own
+# bktr_get_relocation does: bucket 0 covers [0, bucket_virtual_offsets[1]),
+# bucket 1 covers [bucket_virtual_offsets[1], bucket_virtual_offsets[2]),
+# etc. - this function reads and prints EVERY bucket's entries back-to-
+# back in ascending virtual-offset order (which is already the correct
+# global order, since each bucket's own entries are internally sorted by
+# virt_offset and buckets themselves are laid out in ascending
+# virtual-offset-range order), so the caller can treat the combined
+# output exactly like the old single-bucket case's output - no bucket
+# boundary needs to be exposed to callers at all.
 _bktr_parse_bucket0_relocations() {
     local table_file="$1"
     local hdr_hex
@@ -150,36 +174,50 @@ _bktr_parse_bucket0_relocations() {
     local num_buckets total_size
     num_buckets=$((16#$(_bktr_reverse_hex "${hdr_hex:8:8}")))
     total_size=$((16#$(_bktr_reverse_hex "${hdr_hex:16:16}")))
-    [ "$num_buckets" -eq 1 ] || { echo "_bktr_parse_bucket0_relocations: num_buckets=$num_buckets, only 1 is supported" >&2; return 1; }
 
-    local bucket_off=$(( 0x10 + 0x3FF0 ))
-    local bucket_hex
-    bucket_hex="$(dd if="$table_file" bs=1M skip="$bucket_off" iflag=skip_bytes 2>/dev/null | xxd -p | tr -d '\n')"
-    local num_entries
-    num_entries=$((16#$(_bktr_reverse_hex "${bucket_hex:8:8}")))
+    local bucket_stride=$((0x4000))
+    local all_buckets_off=$(( 0x10 + 0x3FF0 ))
+    local all_buckets_size=$(( num_buckets * bucket_stride ))
+    local buckets_hex
+    buckets_hex="$(dd if="$table_file" bs=1M skip="$all_buckets_off" count="$all_buckets_size" iflag=skip_bytes,count_bytes 2>/dev/null | xxd -p | tr -d '\n')"
 
-    local entries_hex_off=$(( 0x10 * 2 ))
+    local b bucket_hex_off bucket_hex num_entries entries_hex_off
     local i entry_off virt phys is_patch
-    for (( i = 0; i < num_entries; i++ )); do
-        entry_off=$(( entries_hex_off + i * 0x14 * 2 ))
-        virt=$((16#$(_bktr_reverse_hex "${bucket_hex:entry_off:16}")))
-        phys=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 16)):16}")))
-        is_patch=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 32)):8}")))
-        echo "$virt $phys $is_patch"
+    for (( b = 0; b < num_buckets; b++ )); do
+        bucket_hex_off=$(( b * bucket_stride * 2 ))
+        bucket_hex="${buckets_hex:bucket_hex_off}"
+        num_entries=$((16#$(_bktr_reverse_hex "${bucket_hex:8:8}")))
+        entries_hex_off=$(( 0x10 * 2 ))
+        for (( i = 0; i < num_entries; i++ )); do
+            entry_off=$(( entries_hex_off + i * 0x14 * 2 ))
+            virt=$((16#$(_bktr_reverse_hex "${bucket_hex:entry_off:16}")))
+            phys=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 16)):16}")))
+            is_patch=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 32)):8}")))
+            echo "$virt $phys $is_patch"
+        done
     done
     echo "$total_size 0 "
 }
 
 # _bktr_parse_bucket0_subsections <table_file>
-# Prints one "<phys_offset> <ctr_val>" line per subsection entry, plus a
-# final synthetic line for physical_offset_end (ctr_val field empty).
-# Same single-bucket assumption and layout style as
-# _bktr_parse_bucket0_relocations, just a different entry shape.
+# Prints one "<phys_offset> <ctr_val>" line per subsection entry (walking
+# EVERY bucket, in ascending physical-offset order - see
+# _bktr_parse_bucket0_relocations' own comment for why concatenating all
+# buckets' entries in order is safe and needs no bucket boundary exposed
+# to the caller), plus a final synthetic line for the LAST bucket's own
+# physical_offset_end (ctr_val field empty) - only the last bucket's
+# value is the true final physical end of the whole table; an earlier
+# bucket's own physical_offset_end is just where THAT bucket's own range
+# ends, not the table's.
 #
 # Layout reference (hactool 1.4.0's bktr.h bktr_subsection_block_t /
-# bktr_subsection_bucket_t):
+# bktr_subsection_bucket_t) - same fixed-size bucket_physical_offsets
+# array (0x3FF0 bytes) and same fixed 0x4000-byte per-bucket stride as
+# _bktr_parse_bucket0_relocations (header 0x10 + entries[0x3FF] of 16
+# bytes each = 0x10 + 0x3FF0 = 0x4000 exactly - no padding needed here
+# since 0x3FF0 % 16 == 0, and no overflow entry either):
 #   Block header (0x10 bytes): u32 _0x0; u32 num_buckets; u64 total_size
-#   Bucket 0 at 0x4000:
+#   Bucket 0 at 0x10 + 0x3FF0 = 0x4000:
 #     Bucket header (0x10 bytes): u32 _0x0; u32 num_entries; u64 physical_offset_end
 #     entries[] (0x10 bytes each): u64 offset; u32 _0x8; u32 ctr_val
 _bktr_parse_bucket0_subsections() {
@@ -188,24 +226,30 @@ _bktr_parse_bucket0_subsections() {
     hdr_hex="$(dd if="$table_file" bs=1 count=$((0x10)) 2>/dev/null | xxd -p | tr -d '\n')"
     local num_buckets
     num_buckets=$((16#$(_bktr_reverse_hex "${hdr_hex:8:8}")))
-    [ "$num_buckets" -eq 1 ] || { echo "_bktr_parse_bucket0_subsections: num_buckets=$num_buckets, only 1 is supported" >&2; return 1; }
 
-    local bucket_off=$(( 0x10 + 0x3FF0 ))
-    local bucket_hex
-    bucket_hex="$(dd if="$table_file" bs=1M skip="$bucket_off" iflag=skip_bytes 2>/dev/null | xxd -p | tr -d '\n')"
-    local num_entries physical_offset_end
-    num_entries=$((16#$(_bktr_reverse_hex "${bucket_hex:8:8}")))
-    physical_offset_end=$((16#$(_bktr_reverse_hex "${bucket_hex:16:16}")))
+    local bucket_stride=$((0x4000))
+    local all_buckets_off=$(( 0x10 + 0x3FF0 ))
+    local all_buckets_size=$(( num_buckets * bucket_stride ))
+    local buckets_hex
+    buckets_hex="$(dd if="$table_file" bs=1M skip="$all_buckets_off" count="$all_buckets_size" iflag=skip_bytes,count_bytes 2>/dev/null | xxd -p | tr -d '\n')"
 
-    local entries_hex_off=$(( 0x10 * 2 ))
-    local i entry_off off ctr_val
-    for (( i = 0; i < num_entries; i++ )); do
-        entry_off=$(( entries_hex_off + i * 0x10 * 2 ))
-        off=$((16#$(_bktr_reverse_hex "${bucket_hex:entry_off:16}")))
-        ctr_val=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 24)):8}")))
-        echo "$off $ctr_val"
+    local b bucket_hex_off bucket_hex num_entries physical_offset_end entries_hex_off
+    local i entry_off off ctr_val last_physical_offset_end
+    for (( b = 0; b < num_buckets; b++ )); do
+        bucket_hex_off=$(( b * bucket_stride * 2 ))
+        bucket_hex="${buckets_hex:bucket_hex_off}"
+        num_entries=$((16#$(_bktr_reverse_hex "${bucket_hex:8:8}")))
+        physical_offset_end=$((16#$(_bktr_reverse_hex "${bucket_hex:16:16}")))
+        last_physical_offset_end="$physical_offset_end"
+        entries_hex_off=$(( 0x10 * 2 ))
+        for (( i = 0; i < num_entries; i++ )); do
+            entry_off=$(( entries_hex_off + i * 0x10 * 2 ))
+            off=$((16#$(_bktr_reverse_hex "${bucket_hex:entry_off:16}")))
+            ctr_val=$((16#$(_bktr_reverse_hex "${bucket_hex:$((entry_off + 24)):8}")))
+            echo "$off $ctr_val"
+        done
     done
-    echo "$physical_offset_end "
+    echo "$last_physical_offset_end "
 }
 
 # bktr_reconstruct <update_nca_path> <keys_file> <update_key_hex> <update_section_num> <base_decrypted_romfs_path> <out_path>
@@ -246,13 +290,28 @@ bktr_reconstruct() {
     bktr_read_relocation_table "$update_nca" "$update_key" "$section_ctr_raw" "$section_offset" "$BKTR_RELOC_OFF" "$BKTR_RELOC_SIZE" "$work_dir/reloc.bin" || { rm -rf "$work_dir"; return 1; }
     bktr_read_subsection_table "$update_nca" "$update_key" "$section_ctr_raw" "$section_offset" "$BKTR_SUBSEC_OFF" "$BKTR_SUBSEC_SIZE" "$work_dir/subsec.bin" || { rm -rf "$work_dir"; return 1; }
 
-    local -a subsec_off subsec_ctrval
+    # Captured via a plain command substitution first, NOT piped straight
+    # into `while read ... done < <(...)`, specifically so a failure
+    # inside the parser (e.g. an unsupported table layout) surfaces as a
+    # clean, checkable exit status here - a process substitution's own
+    # exit code is awkward to check inline, and silently continuing past
+    # a failed parse with these arrays never populated previously crashed
+    # with a bash "unbound variable" error deep inside the reconstruction
+    # loop below instead of a clear message at the point of the real
+    # failure.
+    local subsec_parsed
+    subsec_parsed="$(_bktr_parse_bucket0_subsections "$work_dir/subsec.bin")" || { rm -rf "$work_dir"; return 1; }
+
+    local -a subsec_off=() subsec_ctrval=()
     local off ctr_val
     while read -r off ctr_val; do
         subsec_off+=("$off")
         subsec_ctrval+=("$ctr_val")
-    done < <(_bktr_parse_bucket0_subsections "$work_dir/subsec.bin")
+    done <<< "$subsec_parsed"
     local num_subsec=$(( ${#subsec_off[@]} - 1 ))
+
+    local reloc_parsed
+    reloc_parsed="$(_bktr_parse_bucket0_relocations "$work_dir/reloc.bin")" || { rm -rf "$work_dir"; return 1; }
 
     : > "$out_path"
 
@@ -293,7 +352,7 @@ bktr_reconstruct() {
             fi
         fi
         prev_virt="$virt"; prev_phys="$phys"; prev_is_patch="$is_patch"
-    done < <(_bktr_parse_bucket0_relocations "$work_dir/reloc.bin")
+    done <<< "$reloc_parsed"
 
     rm -rf "$work_dir"
 }

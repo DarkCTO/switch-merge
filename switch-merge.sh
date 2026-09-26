@@ -32,6 +32,20 @@ if [ -d "$SCRIPT_DIR/bin" ]; then
     PATH="$SCRIPT_DIR/bin:$PATH"
 fi
 
+# Every mktemp/mktemp -d call in this script and every sourced lib/*.sh
+# file (there's no single shared "scratch dir" variable threaded through
+# all of them - each function makes its own as needed) honors $TMPDIR
+# before falling back to /tmp, so setting it once here, before anything
+# else runs, redirects the whole project's scratch usage into its own
+# directory instead of system /tmp - a real, hardware-relevant reason:
+# temp NCA/romfs/exefs intermediates for a single title can run into the
+# hundreds of MB to low GB (a full Program NCA rebuild decrypts/rebuilds
+# an entire romfs+exefs in scratch), so a project-local tmp dir on a
+# partition sized for game dumps is both easier to keep an eye on and
+# easier to bulk-clear than hunting through system /tmp.
+export TMPDIR="$SCRIPT_DIR/tmp"
+mkdir -p "$TMPDIR"
+
 # Pure-bash cnmt/NACP/ticket binary parsers (lib/binfmt.sh), NCA header
 # AES-XTS decryption (lib/nca_header.sh), per-title NCA content-key
 # derivation and AES-CTR content decryption (lib/nca_content.sh), PFS0/NSP
@@ -244,12 +258,14 @@ classify_nsp() {
     fi
     [ -n "$base_id" ] || { echo "Could not determine base title id of $nsp" >&2; return 1; }
 
-    echo "$CNMT_TYPE_NAME $base_id"
+    echo "$CNMT_TYPE_NAME $base_id $CNMT_VERSION"
 }
 
 echo "==> Classifying ${#CANDIDATE_NSPS[@]} input NSP(s)"
 declare -A GROUP_BASE=()
+declare -A GROUP_BASE_VERSION=()
 declare -A GROUP_UPDATE=()
+declare -A GROUP_UPDATE_VERSION=()
 declare -A GROUP_DLCS=()   # newline-separated list per group, since bash has no nested arrays
 GROUP_ORDER=()             # preserves first-seen order of title ids
 
@@ -257,8 +273,7 @@ idx=0
 for nsp in "${CANDIDATE_NSPS[@]}"; do
     idx=$((idx + 1))
     classify_out="$(classify_nsp "$nsp" "$idx")" || { echo "  Skipping $nsp (classification failed)" >&2; continue; }
-    nsp_type="${classify_out% *}"
-    base_id="${classify_out#* }"
+    read -r nsp_type base_id nsp_version <<< "$classify_out"
     base_id="${base_id,,}"
 
     if [ -z "${GROUP_DLCS[$base_id]+x}" ]; then
@@ -268,17 +283,36 @@ for nsp in "${CANDIDATE_NSPS[@]}"; do
 
     case "$nsp_type" in
         Application)
-            if [ -n "${GROUP_BASE[$base_id]+x}" ]; then
-                echo "  Multiple base (Application) NSPs found for title $base_id: '${GROUP_BASE[$base_id]}' and '$nsp' - skipping the latter" >&2
-            else
+            # Keep the HIGHEST-version Application if more than one is
+            # given for the same title - same reasoning as Patch below
+            # (a real title dump can legitimately include more than one
+            # base dump at different versions; picking whichever happened
+            # to be classified first, rather than the newest, would be a
+            # silent correctness bug, not just a cosmetic one).
+            if [ -z "${GROUP_BASE[$base_id]+x}" ] || [ "$nsp_version" -gt "${GROUP_BASE_VERSION[$base_id]}" ]; then
+                [ -n "${GROUP_BASE[$base_id]+x}" ] && echo "  Multiple base (Application) NSPs found for title $base_id: keeping '$nsp' (v$nsp_version) over '${GROUP_BASE[$base_id]}' (v${GROUP_BASE_VERSION[$base_id]})" >&2
                 GROUP_BASE[$base_id]="$nsp"
+                GROUP_BASE_VERSION[$base_id]="$nsp_version"
+            else
+                echo "  Multiple base (Application) NSPs found for title $base_id: keeping '${GROUP_BASE[$base_id]}' (v${GROUP_BASE_VERSION[$base_id]}) over '$nsp' (v$nsp_version)" >&2
             fi
             ;;
         Patch)
-            if [ -n "${GROUP_UPDATE[$base_id]+x}" ]; then
-                echo "  Multiple update (Patch) NSPs found for title $base_id: '${GROUP_UPDATE[$base_id]}' and '$nsp' - skipping the latter" >&2
-            else
+            # Keep the HIGHEST-version Patch, not just the first one seen -
+            # `find`'s own directory-listing order (what CANDIDATE_NSPS is
+            # built from) is filesystem-dependent, not sorted by anything
+            # meaningful, so "first seen" could easily be the OLDER update
+            # if a newer one happens to sort first. A real title with two
+            # real update dumps at different versions is exactly the case
+            # this matters for - silently merging an old update instead of
+            # the latest would look like a successful merge with no error
+            # at all, just wrong/outdated content.
+            if [ -z "${GROUP_UPDATE[$base_id]+x}" ] || [ "$nsp_version" -gt "${GROUP_UPDATE_VERSION[$base_id]}" ]; then
+                [ -n "${GROUP_UPDATE[$base_id]+x}" ] && echo "  Multiple update (Patch) NSPs found for title $base_id: keeping '$nsp' (v$nsp_version) over '${GROUP_UPDATE[$base_id]}' (v${GROUP_UPDATE_VERSION[$base_id]})" >&2
                 GROUP_UPDATE[$base_id]="$nsp"
+                GROUP_UPDATE_VERSION[$base_id]="$nsp_version"
+            else
+                echo "  Multiple update (Patch) NSPs found for title $base_id: keeping '${GROUP_UPDATE[$base_id]}' (v${GROUP_UPDATE_VERSION[$base_id]}) over '$nsp' (v$nsp_version)" >&2
             fi
             ;;
         AddOnContent)

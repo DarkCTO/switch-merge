@@ -16,13 +16,44 @@ up quickly and for context `README.md` doesn't cover.
 Working and hardware-verified (installs cleanly, correct version shown,
 game runs and plays correctly) for the base+update+DLC case using the test
 title Dicefolk (`01002A801E57C000`). Also verified end-to-end (structural
-checks + reconstructed-content sanity checks, not yet on real hardware) for
-a second real title, Well Dweller (`0100217023F6C000`, base+update, no
-DLC), merged together with Dicefolk in one real 1G1R batch run. Test files
-live in this directory:
+checks + reconstructed-content sanity checks; not yet confirmed on real
+hardware) for a second real title, Super Smash Bros. Ultimate
+(`01006A800016E000`, base + 2 updates + 99 separate `AddOnContent` DLC
+NSPs), merged together with Dicefolk in one real 1G1R batch run. This is
+by far the largest/most demanding title tested so far (14.6GB base NSP,
+two ~3.9GB update NSPs) and surfaced two real bugs:
+  - `classify_nsp`/the classification loop originally kept whichever
+    Patch (update) NSP was seen first, not the highest-versioned one.
+    Fixed by comparing each group's `Application`/`Patch` NSP against the
+    cnmt's own version integer and keeping the higher one — confirmed
+    working directly from a real merge log line: "Multiple update (Patch)
+    NSPs found for title 01006a800016e000: keeping '...[v2031616][Up
+    v13.0.5].nsp' (v2031616) over '...[v1966080]...nsp' (v1966080)".
+  - `lib/bktr.sh`'s relocation/subsection table parsers only ever handled
+    `num_buckets == 1` (true for every test title up to this point).
+    Smash's update romfs is large enough to need a real bucket tree
+    (29 relocation buckets, 9 subsection buckets) — hit a hard failure
+    ("only 1 is supported") the first time a merge reached BKTR
+    reconstruction for this title. Fixed by rewriting both parsers to walk
+    every bucket; see "Non-obvious things worth remembering" below for the
+    exact bucket-layout bug that came with that fix (a wrong stride
+    guess). Confirmed fixed via a full merge run that produced
+    `Super Smash Bros. Ultimate [01006A800016E000][13.0.5][99].nsp`
+    (17.7GB output, 400 PFS0 entries: 99 `.tik` + 99 `.cert` + 100
+    `.cnmt.nca` + 102 `.nca`) — the `13.0.5`/`99` in the filename itself
+    confirms both the version-supersession fix and that all 99 DLCs made
+    it into the merge.
+  Merging multiple separate `AddOnContent` titles bundled into a single
+  DLC NSP is still untested - every DLC NSP seen so far (Dicefolk,
+  Talisman, and all 99 of Smash's) has turned out to contain exactly one
+  `AddOnContent` title per file, even when a filename implied otherwise
+  (see README's roadmap). Test files live in `roms/` (kept out of the
+  project root for tidiness):
 
 - `Dicefolk [01002A801E57C000][B/U].nsp` + `Dicefolk Chimera Pack [...][D].nsp`
-- `Well Dweller [0100217023F6C000][B/U].nsp`
+- `Super Smash Bros. Ultimate [01006A800016E000][B].nsp` + two `[01006A800016E800]`
+  update NSPs (`v1966080` and `v2031616`/`Up v13.0.5`) + 99 separate
+  `[01006A800016F0XX]` DLC NSPs
 
 Usage is fully auto-detecting — no `-b`/`-u`/per-DLC flags, and handles
 multiple different games in one run. With zero arguments it defaults to
@@ -137,8 +168,12 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
   ever parses wrong (wrong title ID, garbled name, etc.), re-verify against
   `nstool`'s own output on that specific file before assuming the general
   layout is wrong — could just be a field this project hasn't seen a
-  variant of yet (e.g. `ContentMetaAttributes` bits, or a NACP language
-  slot beyond AmericanEnglish).
+  variant of yet (e.g. `ContentMetaAttributes` bits). **Confirmed to
+  actually happen once**: an earlier test title's own NACP (since swapped
+  out for Super Smash Bros. Ultimate) left the AmericanEnglish (slot 0)
+  name empty, with the real name only in slot 1 (BritishEnglish) —
+  `parse_nacp` now scans all 16 language slots for the
+  first non-empty Name instead of assuming slot 0 is always populated.
 - **`hactool` 1.4.0 (the latest release) has a real, confirmed, unfixed
   bug**: two overly-strict exact-equality checks in its BKTR (patch-romfs)
   layout validation reject some legitimate update NCAs with "Invalid BKTR
@@ -152,11 +187,19 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
   locally-patched `hactool` build in `bin/` — patch at
   `bin/patches/hactool-1.4.0-bktr-layout-fix.patch`, full investigation
   (including the actual byte offsets that triggered it) in README's "The
-  debugging story", Bug #3. **If `bin/hactool` is ever rebuilt or
-  replaced, re-apply this patch** — a stock hactool 1.4.0 will silently
-  regress on any title whose update hits this layout (confirmed: Well
-  Dweller does, Dicefolk doesn't — it's title-dependent, not universal, so
-  a regression might not show up in casual testing with just one game).
+  debugging story", Bug #3. **This no longer affects the merge pipeline
+  at all** — `lib/bktr.sh`'s own from-scratch BKTR reconstruction never
+  calls `hactool`, so this bug is now purely a concern for anyone using
+  the vendored `bin/hactool` directly for manual debugging. **If
+  `bin/hactool` is ever rebuilt or replaced for that purpose, re-apply
+  this patch** — a stock hactool 1.4.0 will silently regress on any title
+  whose update hits this layout (confirmed at the time: the project's
+  second test title did, its first didn't — it's title-dependent, not
+  universal, so a regression might not show up in casual testing with
+  just one game; that second test title has since been swapped out, so
+  this specific trigger condition can't be re-confirmed against it, but
+  the underlying hactool bug itself is an upstream, not project-specific,
+  fact).
 - **`openssl enc` has no AES-XTS mode**, hit while reimplementing NCA
   header reading. `aes-128-xts` shows up in `openssl list
   -cipher-algorithms` but the `enc` CLI subcommand refuses it at runtime
@@ -189,6 +232,24 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
   the per-group failure-isolation logic again, re-read that first — it's
   easy to silently reintroduce (failures start looking like successes) if
   this pattern gets "simplified."
+- **BKTR relocation/subsection bucket stride is a fixed 0x4000 bytes per
+  bucket, not 0x4000-plus-an-overflow-entry.** Hit while adding
+  multi-bucket support to `lib/bktr.sh` (every test title before Smash
+  Bros Ultimate only ever had `num_buckets == 1`, so this never mattered
+  before). An initial reading of hactool's own comments led to a wrong
+  guess of 0x4014 (relocation) / 0x4010 (subsection) stride, i.e. bucket
+  body plus room for one extra entry - that guess read past the end of a
+  real 29-bucket relocation table and crashed with `16#: invalid integer
+  constant` (an empty hex slice past EOF). The actual struct layout
+  (`bktr_relocation_bucket_t`/`bktr_subsection_bucket_t` in hactool's
+  `bktr.h`) packs header + entries + padding to exactly 0x4000 bytes with
+  no overflow room at all - confirmed both by computing it directly from
+  the struct's own field sizes and by checking that `0x4000 * (num_buckets
+  + 1)` (the +1 for the block header) exactly equals the real captured
+  table file's size for both a 29-bucket and a 9-bucket real table. If
+  BKTR parsing is ever touched again, re-derive bucket size from the
+  actual `bktr.h` struct fields, not from a comment restating an earlier
+  guess.
 
 ## Environment
 
@@ -214,44 +275,44 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
 
 1. Re-read `README.md` in full — it has the authoritative, kept-current
    pipeline description, known issues, and roadmap.
-2. The user asked, at one point, about removing the dependency on
-   `nstool`/`hacpack`/`hactool` entirely and reimplementing their
-   functionality directly. Tackled in two scoped sessions rather than all
-   at once: first cnmt/NACP binary parsing (`lib/binfmt.sh`), then NCA
-   header AES-XTS decryption for `RightsId` (`lib/nca_header.sh`) and flat
-   PFS0/NSP packing (`lib/pfs0.sh`) - explicitly chosen as the next
-   lowest-risk pieces (no per-title crypto, no hash-tree construction) via
-   a direct question to the user before starting, since the *initial*
-   assumption that NCA-header reading was "trivial, no crypto" turned out
-   to be wrong (it's AES-XTS-encrypted) and had to be corrected and
-   re-confirmed with the user before proceeding. **Remaining, still on the
-   vendored tools, and NOT casually reimplementable**: NCA
-   content-partition decrypt/extract (per-title AES-CTR/titlekey crypto,
-   hash-tree verification), NCA *building* for Program/Meta (writing hash
-   trees, encrypting content), HFS0/RomFS packing, and BKTR bucket-tree
-   parsing/rebuilding. These are a materially higher risk tier than
-   anything done so far - a wrong implementation produces *silently
-   corrupted* game/save data, not a clean error - and were deliberately
-   not attempted without the user explicitly choosing that scope each
-   time. Don't assume "extract dependencies" as an open standing goal to
-   keep chipping away at unprompted - each piece was a separate, scoped
-   ask, and the natural next candidates (AES-CTR content decryption, BKTR)
-   are meaningfully riskier than what's been done - flag that risk clearly
-   and ask before touching them, the same way NCA-header AES-XTS was
-   flagged and re-confirmed once its real complexity became clear.
-3. Roadmap's open remaining item: multi-title DLC packs (only single-
-   `AddOnContent`-title DLC has been tested); XCI output was investigated
-   and explicitly decided against (see README roadmap).
+2. **Vendored-tool elimination is done.** `nstool`/`hacpack`/`hactool` are
+   all confirmed unused by the merge pipeline (see README roadmap's
+   "fourth" through "eighth piece" entries for the full history: cnmt/NACP
+   parsing, NCA-header AES-XTS, PFS0 packing, ticket parsing, per-title
+   AES-CTR content decryption, BKTR reconstruction, and finally NCA
+   *building* - hash-tree construction, romfs container building - all
+   reimplemented and verified byte-for-byte against real tool output).
+   Confirmed via wrapper-substitution testing (replace a vendored binary
+   with a script that fails loudly if invoked, then run a full merge and
+   confirm it never fires) — done for all three simultaneously as the
+   final check. All three remain vendored in `bin/` purely for optional
+   manual debugging/cross-verification, not as a runtime dependency.
+   Don't assume there's a next vendored-tool piece to chip away at; if the
+   user raises it again, treat it as a new ask, not a continuation.
+3. Roadmap's open remaining item: multi-title DLC packs (a single DLC NSP
+   containing more than one `AddOnContent` title) — still untested, no
+   real file with that shape has been available yet. An earlier test
+   title's DLC NSP looked promising (filenamed "20 DLCs") but turned out,
+   on actually reading its cnmt, to contain exactly one `AddOnContent`
+   title — the "20" referred to how many separate DLC purchases/NSPs
+   exist for the game in total, not how many are bundled in this one
+   file. Smash Bros Ultimate's 99 DLCs are the same shape: 99 separate
+   single-title NSPs, not one bundle. XCI output was investigated and
+   explicitly decided against (see README roadmap).
 4. If a new title hits a new error, check first whether it's a variant of
    the known issues in README (BKTR delta, zero digest, hactool BKTR
-   layout bug, AES-XTS mistweak, PFS0 NUL-drop) before assuming something
-   new — several produced similar-looking generic errors and took real
-   digging to tell apart.
+   layout bug, AES-XTS mistweak, PFS0 NUL-drop, NACP language-slot
+   fallback) before assuming something new — several produced
+   similar-looking generic errors and took real digging to tell apart.
 5. Multi-title batch mode (1G1R) is confirmed end-to-end with two real,
-   different games (Dicefolk + Well Dweller) merged together in one run.
-   Well Dweller's merge was verified structurally and via reconstructed-
-   content sanity checks (file listing diff against base, spot-checked an
-   unchanged config file's content, checked the main game data file's size
-   grew plausibly) but **not yet confirmed on real hardware** — unlike
-   Dicefolk, which was. If you get a chance to test Well Dweller's merged
-   NSP on a real Switch, that's the next real confirmation worth doing.
+   different games (Dicefolk + Super Smash Bros. Ultimate) merged together
+   in one run, including the largest/most demanding title tested so far
+   (14.6GB base, two updates, 99 DLCs) and the first real exercise of a
+   multi-bucket BKTR table (29 relocation buckets, 9 subsection buckets).
+   Smash's merge was verified structurally (PFS0 entry-count/type
+   breakdown: 99 `.tik` + 99 `.cert` + 100 `.cnmt.nca` + 102 `.nca`) and via
+   the output filename itself confirming both the version-supersession fix
+   (`13.0.5`, the newer of its two updates) and full DLC coverage (`99`),
+   but **not yet confirmed on real hardware** — unlike Dicefolk, which was.
+   If you get a chance to test the merged Smash Bros NSP on a real Switch,
+   that's the next real confirmation worth doing.

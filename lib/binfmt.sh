@@ -159,12 +159,27 @@ parse_cnmt() {
 }
 
 # parse_nacp <path to control.nacp file>
-# Sets NACP_NAME and NACP_DISPLAY_VERSION from the AmericanEnglish (index 0)
-# language entry and the DisplayVersion field.
+# Sets NACP_NAME and NACP_DISPLAY_VERSION from the DisplayVersion field and
+# the first non-empty language entry's Name, checked in switchbrew's own
+# listed order starting from AmericanEnglish (index 0) - NOT always index
+# 0 itself. A real title (Talisman) was found with an entirely empty
+# AmericanEnglish slot and its actual Name only in slot 1
+# (BritishEnglish) - reading only slot 0 silently produced an empty name,
+# and switch-merge.sh's own filename-from-NACP step then fell back to a
+# bare title-ID filename instead of failing loudly, which is what made
+# this easy to miss until a real title exercised it. Checking every slot
+# for the first non-empty Name (rather than hardcoding a single fallback
+# index) matches how the console itself resolves a name when the current
+# system language's own slot is unpopulated - it does not always mean the
+# NEXT index has it either, so this can't be simplified to "try slot 0,
+# then slot 1".
 #
 # Layout reference (switchbrew.org/wiki/NACP):
-#   Per-language title entry: 0x300 bytes, 16(+) entries starting at 0x0.
-#     Index 0 = AmericanEnglish.
+#   Per-language title entry: 0x300 bytes, 16 entries starting at 0x0, in
+#     this fixed order: AmericanEnglish, BritishEnglish, Japanese, French,
+#     German, LatinAmericanSpanish, Spanish, Italian, Dutch,
+#     CanadianFrench, Portuguese, Russian, Korean, TraditionalChinese,
+#     SimplifiedChinese, BrazilianPortuguese.
 #     0x000 (0x200 bytes) Name, NUL-padded
 #     0x200 (0x100 bytes) Publisher, NUL-padded
 #   0x3060 (0x10 bytes) DisplayVersion, NUL-padded
@@ -173,7 +188,13 @@ parse_nacp() {
     local hex
     hex="$(hex_of_file "$path")"
 
-    NACP_NAME="$(hex_to_text "$(hex_field_raw "$hex" 0 512)")"
+    NACP_NAME=""
+    local slot slot_off
+    for (( slot = 0; slot < 16; slot++ )); do
+        slot_off=$(( slot * 0x300 ))
+        NACP_NAME="$(hex_to_text "$(hex_field_raw "$hex" "$slot_off" 512)")"
+        [ -n "$NACP_NAME" ] && break
+    done
     NACP_DISPLAY_VERSION="$(hex_to_text "$(hex_field_raw "$hex" 12384 16)")"
 }
 
