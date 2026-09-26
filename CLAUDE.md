@@ -15,11 +15,11 @@ up quickly and for context `README.md` doesn't cover.
 
 Working and hardware-verified (installs cleanly, correct version shown,
 game runs and plays correctly) for the base+update+DLC case using the test
-title Dicefolk (`01002A801E57C000`). Also verified end-to-end (structural
-checks + reconstructed-content sanity checks; not yet confirmed on real
-hardware) for a second real title, Super Smash Bros. Ultimate
-(`01006A800016E000`, base + 2 updates + 99 separate `AddOnContent` DLC
-NSPs), merged together with Dicefolk in one real 1G1R batch run. This is
+title Dicefolk (`01002A801E57C000`). **Also now hardware-verified** for a
+second real title, Super Smash Bros. Ultimate (`01006A800016E000`, base +
+2 updates + 99 separate `AddOnContent` DLC NSPs), merged together with
+Dicefolk in one real 1G1R batch run — confirmed installing and playing
+correctly on real hardware. This is
 by far the largest/most demanding title tested so far (14.6GB base NSP,
 two ~3.9GB update NSPs) and surfaced two real bugs:
   - `classify_nsp`/the classification loop originally kept whichever
@@ -313,6 +313,9 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
    breakdown: 99 `.tik` + 99 `.cert` + 100 `.cnmt.nca` + 102 `.nca`) and via
    the output filename itself confirming both the version-supersession fix
    (`13.0.5`, the newer of its two updates) and full DLC coverage (`99`),
-   but **not yet confirmed on real hardware** — unlike Dicefolk, which was.
-   If you get a chance to test the merged Smash Bros NSP on a real Switch,
-   that's the next real confirmation worth doing.
+   and **now confirmed on real hardware** too, same as Dicefolk — installs
+   and plays correctly.
+6. Both test titles are now hardware-verified. The next open item is the
+   roadmap's remaining unchecked box: multi-title DLC packs (a single DLC
+   NSP containing more than one `AddOnContent` title) — still untested, no
+   real file with that shape has turned up yet.

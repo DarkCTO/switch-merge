@@ -787,7 +787,8 @@ above.
       the full romfs/exefs via `hactool --basenca` against the base, then
       rebuilds a standalone standard-crypto Program NCA via
       `hacpack --ncatype program --plaintext`, which needs no ticket at all.
-      Confirmed on real hardware for this project's test title.
+      Confirmed on real hardware for both of this project's test titles
+      (Dicefolk and Super Smash Bros. Ultimate).
 - [x] Descriptive output filename — implemented: the merged NSP is renamed
       to `<Name> [<TitleId>][<DisplayVersion>][<DLC count>].nsp`, reading
       `Name`/`DisplayVersion` from the merged Control NCA's NACP instead of
