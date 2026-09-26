@@ -5,11 +5,11 @@ update NSP + any number of DLC NSPs into a single installable NSP, for one
 or many games at once (1G1R). See `README.md` for full usage, pipeline
 details, and known issues — that file is kept up to date and is the
 primary reference. It now also has a "Switch content format, from
-scratch" primer (NCA/cnmt/RightsId/BKTR concepts) and a "The debugging
-story" narrative walking through all three real bugs found so far — read
-those if a new title produces an unfamiliar error before assuming it's
-something new. This file is for picking the workflow back up quickly and
-for context `README.md` doesn't cover.
+scratch" primer (NCA/cnmt/RightsId/BKTR/PFS0/AES-XTS concepts) and a "The
+debugging story" narrative walking through all five real bugs found so
+far — read those if a new title produces an unfamiliar error before
+assuming it's something new. This file is for picking the workflow back
+up quickly and for context `README.md` doesn't cover.
 
 ## Current state
 
@@ -45,15 +45,20 @@ per group, failures in one group don't stop the others.
 vendored in `bin/`, which the script puts first on `PATH` automatically.
 No system package install needed, and `bin/hactool` specifically carries a
 local fix for a real upstream bug (see below) that the system/AUR version
-doesn't have. **cnmt and NACP parsing no longer uses `nstool` at all** —
-`lib/binfmt.sh` reads those two binary formats directly in pure bash (just
-`xxd` + string slicing, verified byte-for-byte against `nstool`'s own
-output on real files). Everything involving actual NCA container
-decryption/extraction, packing, and BKTR reconstruction still goes through
-the vendored tools — reimplementing crypto/hash-tree/BKTR logic from
-scratch risks silent data corruption on a subtle bug, which isn't worth it
-given these tools are already open-source and locally patchable (see the
-hactool BKTR fix below) when something's actually wrong with them.
+doesn't have. **cnmt/NACP parsing, NCA-header `RightsId` reading, and
+NSP/PFS0 packing no longer use `nstool`/`hacpack` at all** — `lib/binfmt.sh`
+reads cnmt/NACP directly in pure bash, `lib/nca_header.sh` decrypts just
+the NCA header (AES-XTS, built from raw `openssl enc -aes-128-ecb` since
+`openssl enc` has no XTS mode of its own) to read `RightsId`, and
+`lib/pfs0.sh` packs the final NSP container, verified byte-for-byte
+identical to a real `hacpack`-produced NSP via `cmp`. Everything involving
+actual NCA content-partition decryption/extraction, NCA *building*
+(Meta/Program — which needs to write hash trees, not just read them), and
+BKTR reconstruction still goes through the vendored tools —
+reimplementing that from scratch risks silent data corruption on a subtle
+bug, which isn't worth it given these tools are already open-source and
+locally patchable (see the hactool BKTR fix below) when something's
+actually wrong with them.
 
 ## Non-obvious things worth remembering
 
@@ -119,6 +124,26 @@ hactool BKTR fix below) when something's actually wrong with them.
   regress on any title whose update hits this layout (confirmed: Well
   Dweller does, Dicefolk doesn't — it's title-dependent, not universal, so
   a regression might not show up in casual testing with just one game).
+- **`openssl enc` has no AES-XTS mode**, hit while reimplementing NCA
+  header reading. `aes-128-xts` shows up in `openssl list
+  -cipher-algorithms` but the `enc` CLI subcommand refuses it at runtime
+  ("enc XTS ciphers not supported") — permanent upstream limitation, same
+  for GCM/CCM, not fixable with flags. Worked around by building XTS from
+  its actual definition using only `openssl enc -aes-128-ecb` (two AES-ECB
+  ops per 16-byte block, one for the tweak one for the data, plus
+  GF(2^128) tweak-doubling in bash arithmetic). Full derivation in
+  `lib/nca_header.sh` and README's "The debugging story", Bug #4. Also:
+  Nintendo's NCA header tweak is non-standard (big-endian sector number,
+  not little-endian) - get that backwards and you get silent garbage, not
+  an error.
+- **Bash silently drops embedded NUL bytes from string variables** — the
+  bug behind PFS0 packing corruption (`lib/pfs0.sh`, Bug #5 in README).
+  `s="a"$'\0'"b"; printf '%s' "$s"` only prints `a` even though `${#s}`
+  correctly reports length 3. Any format that needs multiple NUL-separated
+  strings written out (PFS0's filename table is one; there may be others
+  if this project ever touches more binary formats) must stream each piece
+  directly via its own `printf '%s\0'` call - never accumulate them in one
+  bash variable first and print that at the end.
 - **Bash `errexit`-in-a-tested-command gotcha**, hit while adding batch
   mode: `if ( set -e; some_func ); then` does NOT give you working `-e`
   inside the subshell — bash disables errexit for any command whose exit
@@ -138,9 +163,10 @@ hactool BKTR fix below) when something's actually wrong with them.
   above) — no system package needed. If `bin/` is ever missing (fresh
   checkout without the binaries), the script falls back to `PATH`, but
   then loses the `hactool` BKTR fix; see the note above about that.
-- `xxd` (ships with `vim`/`vim-common`) is a new dependency, needed by
-  `lib/binfmt.sh`. Not vendored (it's tiny and near-universal), but the
-  script checks for it explicitly at startup with a clear error if missing.
+- `xxd` (ships with `vim`/`vim-common`) is needed by `lib/binfmt.sh`.
+  `openssl` (near-universal) is needed by `lib/nca_header.sh`. Neither is
+  vendored (both are tiny/common enough not to bother), but the script
+  checks for both explicitly at startup with a clear error if missing.
 - `~/.switch/prod.keys` — had a formatting bug on first use (some key
   entries had a stray trailing `00` byte); fixed in place, original backed
   up to `~/.switch/prod.keys.bak`. If `hacpack`/`hactool` throw "Failed to
@@ -157,25 +183,38 @@ hactool BKTR fix below) when something's actually wrong with them.
    pipeline description, known issues, and roadmap.
 2. The user asked, at one point, about removing the dependency on
    `nstool`/`hacpack`/`hactool` entirely and reimplementing their
-   functionality directly. Explicitly scoped down to just the easiest,
-   lowest-risk piece first (cnmt/NACP binary parsing, done - see
-   `lib/binfmt.sh`) rather than attempting the whole thing at once. NCA
-   container decryption (AES-CTR/titlekey crypto, hash-tree verification),
-   PFS0/HFS0/RomFS packing, and BKTR bucket-tree parsing/rebuilding are all
-   still on the vendored tools - reimplementing those from scratch is a
-   much bigger, higher-risk undertaking (wrong crypto or hash-tree math
-   produces *silently corrupted* output, not a clean error) that was
-   deliberately not attempted without the user explicitly choosing that
-   scope. Don't assume "extract dependencies" as an open standing goal to
-   keep chipping away at unprompted - it was a scoped, one-time ask.
-2. Roadmap's open remaining item: multi-title DLC packs (only single-
+   functionality directly. Tackled in two scoped sessions rather than all
+   at once: first cnmt/NACP binary parsing (`lib/binfmt.sh`), then NCA
+   header AES-XTS decryption for `RightsId` (`lib/nca_header.sh`) and flat
+   PFS0/NSP packing (`lib/pfs0.sh`) - explicitly chosen as the next
+   lowest-risk pieces (no per-title crypto, no hash-tree construction) via
+   a direct question to the user before starting, since the *initial*
+   assumption that NCA-header reading was "trivial, no crypto" turned out
+   to be wrong (it's AES-XTS-encrypted) and had to be corrected and
+   re-confirmed with the user before proceeding. **Remaining, still on the
+   vendored tools, and NOT casually reimplementable**: NCA
+   content-partition decrypt/extract (per-title AES-CTR/titlekey crypto,
+   hash-tree verification), NCA *building* for Program/Meta (writing hash
+   trees, encrypting content), HFS0/RomFS packing, and BKTR bucket-tree
+   parsing/rebuilding. These are a materially higher risk tier than
+   anything done so far - a wrong implementation produces *silently
+   corrupted* game/save data, not a clean error - and were deliberately
+   not attempted without the user explicitly choosing that scope each
+   time. Don't assume "extract dependencies" as an open standing goal to
+   keep chipping away at unprompted - each piece was a separate, scoped
+   ask, and the natural next candidates (AES-CTR content decryption, BKTR)
+   are meaningfully riskier than what's been done - flag that risk clearly
+   and ask before touching them, the same way NCA-header AES-XTS was
+   flagged and re-confirmed once its real complexity became clear.
+3. Roadmap's open remaining item: multi-title DLC packs (only single-
    `AddOnContent`-title DLC has been tested); XCI output was investigated
    and explicitly decided against (see README roadmap).
-3. If a new title hits a new error, check first whether it's a variant of
+4. If a new title hits a new error, check first whether it's a variant of
    the known issues in README (BKTR delta, zero digest, hactool BKTR
-   layout bug) before assuming something new — several produced
-   similar-looking generic errors and took real digging to tell apart.
-4. Multi-title batch mode (1G1R) is confirmed end-to-end with two real,
+   layout bug, AES-XTS mistweak, PFS0 NUL-drop) before assuming something
+   new — several produced similar-looking generic errors and took real
+   digging to tell apart.
+5. Multi-title batch mode (1G1R) is confirmed end-to-end with two real,
    different games (Dicefolk + Well Dweller) merged together in one run.
    Well Dweller's merge was verified structurally and via reconstructed-
    content sanity checks (file listing diff against base, spot-checked an

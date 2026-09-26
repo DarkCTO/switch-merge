@@ -32,17 +32,25 @@ if [ -d "$SCRIPT_DIR/bin" ]; then
     PATH="$SCRIPT_DIR/bin:$PATH"
 fi
 
-# Pure-bash cnmt/NACP binary parsers (lib/binfmt.sh) - no external tool
-# dependency for reading these two small, well-documented formats. See
-# README's "The debugging story" for how these were derived and verified
-# against nstool's own output on real files. Everything else (NCA
-# decrypt/extract, NSP/NCA packing, BKTR reconstruction) still goes through
-# the vendored nstool/hacpack/hactool, since those involve AES-CTR/titlekey
-# crypto, hash-tree verification, and BKTR bucket-tree parsing where a
-# subtly wrong from-scratch implementation would silently produce corrupted
-# output rather than a clean error - not worth that risk for what's already
-# working, tested, patched-where-needed tooling.
+# Pure-bash cnmt/NACP binary parsers (lib/binfmt.sh), NCA header AES-XTS
+# decryption (lib/nca_header.sh), and PFS0/NSP container packing
+# (lib/pfs0.sh) - reduces the dependency on nstool/hacpack for these
+# operations. See README's "The debugging story" for how these were
+# derived and verified against nstool's/hacpack's own output on real
+# files (including a real bug found and fixed along the way: bash
+# silently drops embedded NUL bytes from string variables, which broke
+# the PFS0 string table's null-terminated filenames until file writes
+# were changed to stream NULs directly via printf instead of building a
+# combined string first). NCA content partition decrypt/extract, NCA
+# packing (Program/Meta), and BKTR reconstruction still go through the
+# vendored nstool/hacpack/hactool, since those involve per-title
+# AES-CTR/titlekey crypto, hash-tree verification, and BKTR bucket-tree
+# parsing where a subtly wrong from-scratch implementation would silently
+# produce corrupted output rather than a clean error - not worth that risk
+# for what's already working, tested, patched-where-needed tooling.
 source "$SCRIPT_DIR/lib/binfmt.sh"
+source "$SCRIPT_DIR/lib/nca_header.sh"
+source "$SCRIPT_DIR/lib/pfs0.sh"
 
 KEYS="$HOME/.switch/prod.keys"
 OUT_DIR="$SCRIPT_DIR/merged"
@@ -71,6 +79,7 @@ command -v nstool >/dev/null || { echo "nstool not found in PATH" >&2; exit 1; }
 command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }
 command -v hactool >/dev/null || { echo "hactool not found in PATH" >&2; exit 1; }
 command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
+command -v openssl >/dev/null || { echo "openssl not found in PATH (needed by lib/nca_header.sh)" >&2; exit 1; }
 
 # Expand any directory inputs to the *.nsp files directly inside them
 # (non-recursive), and pass individual file inputs through unchanged.
@@ -266,7 +275,7 @@ merge_group() {
     # application - see README for the full story.
     local PRIMARY_PROGRAM_SRC PROGRAM_RIGHTS_ID PROGRAM_PATH
     PRIMARY_PROGRAM_SRC="$(find "$PRIMARY_DIR" -maxdepth 1 -iname "${PROGRAM_NCA}.nca" | head -n1)"
-    PROGRAM_RIGHTS_ID="$(nstool -k "$KEYS" -t nca -v "$PRIMARY_PROGRAM_SRC" 2>/dev/null | grep -oP 'RightsId:\s*\K[0-9A-Fa-f]+' | head -n1)"
+    PROGRAM_RIGHTS_ID="$(nca_rights_id "$PRIMARY_PROGRAM_SRC" "$KEYS")"
 
     if [ -n "$PROGRAM_RIGHTS_ID" ] && [ -n "$UPDATE_NSP" ]; then
         echo "==> [$title_id] Update Program NCA is titlekey-crypto (RightsId $PROGRAM_RIGHTS_ID) - reconstructing full romfs/exefs against base"
@@ -429,13 +438,12 @@ merge_group() {
     done
 
     echo "==> [$title_id] Packing merged NSP"
-    hacpack -k "$KEYS" \
-        --type nsp \
-        --ncadir "$MERGE_DIR" \
-        --titleid "$BASE_TITLE_ID" \
-        -o "$OUT_DIR" >/dev/null
-
     local PACKED_NSP="$OUT_DIR/${BASE_TITLE_ID,,}.nsp"
+    local merge_files=()
+    while IFS= read -r -d '' f; do
+        merge_files+=("$f")
+    done < <(find "$MERGE_DIR" -maxdepth 1 -type f -print0 | sort -z)
+    pfs0_pack "$PACKED_NSP" "${merge_files[@]}"
     local RESULT
 
     # Rename to "<Name> [<TitleId>][<DisplayVersion>][<DLC count>].nsp"

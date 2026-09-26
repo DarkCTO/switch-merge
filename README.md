@@ -21,6 +21,10 @@ document assumes it. If you just want to use the tool, skip to "Usage".
 - `xxd` (ships with `vim`/`vim-common` on most distros, but isn't always
   preinstalled on a minimal system) — used by `lib/binfmt.sh` for pure-bash
   binary parsing, see below.
+- `openssl` (near-universal) — used by `lib/nca_header.sh` as a raw
+  AES-128-ECB block-cipher primitive, to build AES-XTS decryption of the
+  NCA header from scratch (the `openssl enc` CLI has no XTS mode of its
+  own — see "The debugging story" below for why).
 - Your console's `prod.keys` at `~/.switch/prod.keys` (standard Lockpick_RCM
   output location).
 
@@ -165,7 +169,50 @@ An NSP file (what you download/dump) is just a **PFS0** (a flat, unencrypted
 container format — think of it like a tar with no compression) holding a
 handful of NCAs plus, sometimes, a ticket/cert pair (see "Tickets and
 titlekeys" below). `nstool --fstree some.nsp` lists what's inside without
-extracting anything.
+extracting anything. Byte layout used by this project's `lib/pfs0.sh`
+(verified byte-for-byte against real hacpack-produced NSPs — see "The
+debugging story"):
+
+```
+Header (0x10 bytes):
+  0x0  u32  Magic ("PFS0")
+  0x4  u32  EntryCount
+  0x8  u32  StringTableSize
+  0xC  u32  Reserved (0)
+PartitionEntry (0x18 bytes each, EntryCount of them, right after header):
+  0x0  u64  Offset      <- relative to the start of FILE DATA, not the PFS0 file
+  0x8  u64  Size
+  0x10 u32  StringTableOffset
+  0x14 u32  Reserved (0)
+String table: EntryCount NUL-terminated filenames, concatenated, then
+  padded with NUL bytes so the raw content rounds up to a multiple of
+  0x20 (32) bytes.
+File data: every file's raw bytes, in PartitionEntry order, with NO
+  gaps/padding between files.
+```
+
+The NCA header itself is a different story — it's **encrypted**, not
+plaintext. The first 0xC00 bytes of every NCA (an 0x400 main header + one
+0x200 header per content section) are AES-XTS encrypted with a *fixed* key
+(`header_key` in `prod.keys` — the same on every console, unlike the
+per-title keys covered below), using a non-standard tweak: Nintendo
+encodes the sector number **big-endian** to derive each sector's initial
+tweak, where the XTS standard uses little-endian for this step. Fields
+worth knowing about, all inside that encrypted region:
+
+```
+0x200 (0x4)  Magic ("NCA3")
+0x205 (0x1)  ContentType   <- 0=Program, 1=Meta, 2=Control, 3=Manual,
+                              4=Data, 5=PublicData (own enum, NOT the
+                              same numbering as the cnmt's ContentType)
+0x210 (0x8)  ProgramId
+0x230 (0x10) RightsId      <- all-zero if standard crypto, a real value
+                              if titlekey crypto (see below)
+```
+
+`lib/nca_header.sh` decrypts just enough of this to read `RightsId`,
+building AES-XTS from scratch out of raw AES-ECB operations (`openssl enc`
+has no XTS mode of its own — see "The debugging story" for why).
 
 ### The Meta NCA and cnmt: the manifest
 
@@ -478,6 +525,56 @@ unpatched `nstool`/`hacpack`) is vendored in `bin/` — see "Requirements"
 above — so this fix is applied automatically without any system package
 changes.
 
+**Bug #4 — `openssl enc` silently rejects AES-XTS, found while trying to
+read RightsId without `nstool`.** The NCA header (the first 0xC00 bytes of
+every NCA, containing fields like `RightsId`, `ContentType`, `ProgramId`)
+is encrypted with AES-XTS using a *fixed* key from `prod.keys`
+(`header_key`) — unlike the content partitions, which use per-title keys.
+Since this is a fixed, publicly-known key (not something requiring a
+ticket), it looked like a good next candidate for reading without
+`nstool`. `openssl enc -aes-128-xts` lists as a supported cipher
+(`openssl list -cipher-algorithms`) but the `enc` CLI subcommand itself
+refuses to use it at runtime ("enc XTS ciphers not supported") — a
+permanent, documented limitation of that specific subcommand (also true
+for GCM/CCM), not a configuration issue. **Fix:** built AES-XTS from its
+actual definition (NIST SP 800-38E / IEEE P1619) using only
+`openssl enc -aes-128-ecb` as the raw block-cipher primitive — two AES-ECB
+operations per 16-byte block (one for the tweak, one for the data) plus
+GF(2^128) multiply-by-2 for advancing the tweak within a sector, all in
+bash arithmetic. Nintendo's NCA header additionally uses a **non-standard
+tweak**: the sector number is encoded big-endian before being AES-encrypted
+to produce the initial per-sector tweak, where standard XTS uses
+little-endian for this step (confirmed via a community reverse-engineering
+gist, and by testing — decrypting with the standard little-endian tweak
+produces garbage, not "NCA3"). Every step of the construction (the GF(2^128)
+doubling function specifically) was verified against known-correct test
+vectors from Python's `cryptography` library before being trusted against
+real data, and the full pipeline was verified end-to-end by decrypting a
+real NCA header and confirming the "NCA3" magic and `RightsId` matched
+`nstool`'s own decryption byte-for-byte. See `lib/nca_header.sh`.
+
+**Bug #5 — bash silently drops embedded NUL bytes, found while
+reimplementing PFS0 packing.** PFS0 (the flat container format NSP files
+and NCA exefs sections use) separates filenames in its string table with
+NUL bytes. The first implementation built the whole string table as one
+bash string (`string_table+="$name"$'\0'`) and wrote it out with
+`printf '%s' "$string_table"` at the end. This looked correct — `${#s}`
+even reports the right length, including the NULs — but `printf '%s'`
+(and any C-string-style output) treats a NUL as a terminator and silently
+stops there, dropping everything after the *first* embedded NUL in the
+whole accumulated string. The result: every filename after the first one
+ran together with no separator, corrupting the table. `nstool` reading
+this back happily parsed the first filename, then treated the rest of the
+partition as one garbled filename with random NCA content appended,
+producing warnings like `SubStream offset is greater than the maximum
+possible offset`. **Fix:** never build a multi-NUL string in a bash
+variable at all — stream each filename directly to the output with its own
+`printf '%s\0'` call instead of accumulating them first. Verified by
+packing a real DLC's two NCAs and diffing the result **byte-for-byte**
+against the original hacpack-produced NSP (`cmp` reported identical
+files), and separately confirming `nstool --fstree` reads the repacked
+file back with a clean, correct file tree. See `lib/pfs0.sh`.
+
 ### Pipeline (what the script does)
 
 0. Expand any directory inputs to the `.nsp` files directly inside them,
@@ -503,10 +600,12 @@ changes.
    cnmt for the base title ID (`TitleId` if primary is the base,
    `ApplicationId` if primary is the update), `Version`, and the NCA IDs
    for `Program`/`Control`/`LegalInformation`.
-4. `nstool -t nca -v` on the primary source's Program NCA — check for a
-   `RightsId`. If one is present **and** an update was found, branch into
-   the BKTR reconstruction path (steps 4a–4d); otherwise skip straight to
-   step 5 using the primary source's Program NCA unmodified.
+4. `nca_rights_id` (`lib/nca_header.sh`, pure bash AES-XTS decryption of
+   just the NCA header, no `nstool` call) on the primary source's Program
+   NCA — check for a `RightsId`. If one is present **and** an update was
+   found, branch into the BKTR reconstruction path (steps 4a–4d);
+   otherwise skip straight to step 5 using the primary source's Program
+   NCA unmodified.
    1. Extract the base NSP's own Program NCA + ticket independently (not
       just the primary source), plus both sides' raw ticket-encrypted
       titlekeys (`nstool -t tik -v`, the `Title Key: Data:` field).
@@ -541,10 +640,10 @@ changes.
    since the DLC's own Meta NCA already declares the correct type
    (`AddOnContent`) and references the base title ID via `ApplicationId`.
    Also copies the DLC's own `.tik`/`.cert` if present.
-8. `hacpack --type nsp --ncadir <dir> --titleid <base_id>` — pack
+8. `pfs0_pack` (`lib/pfs0.sh`, pure bash, no `hacpack` call) — pack
    everything (the new Meta NCA, the Program NCA from step 4,
    Control/LegalInformation NCAs, any tickets/certs, and each DLC's own
-   Meta + Data NCAs) into one NSP.
+   Meta + Data NCAs) into one flat PFS0 (NSP) container.
 9. `nstool -x` the merged Control NCA, then `parse_nacp` (`lib/binfmt.sh`,
    pure bash, no `nstool` call) on the resulting `control.nacp` to read the
    game's display `Name` and `DisplayVersion`, then rename the packed NSP
@@ -633,6 +732,16 @@ above.
   validation reject some legitimate update NCAs. Fixed by vendoring a
   locally-patched `hactool` in `bin/` — see "Requirements" above and
   `bin/patches/hactool-1.4.0-bktr-layout-fix.patch`.
+- **`openssl enc` refuses AES-XTS mode entirely** — see "Bug #4" above.
+  A permanent limitation of that specific CLI subcommand, not a config
+  issue. Fixed by building AES-XTS from raw AES-ECB operations
+  (`lib/nca_header.sh`), since `openssl enc -aes-128-ecb` works fine.
+- **Filenames running together with no separator when repacking a PFS0**
+  — see "Bug #5" above. Caused by bash silently dropping everything after
+  the first embedded NUL byte when a multi-NUL string was built as one
+  bash variable and printed with `printf '%s'`. Fixed by streaming each
+  filename directly to the output with its own `printf '%s\0'` call
+  instead (`lib/pfs0.sh`).
 
 ## Tools considered and ruled out
 
@@ -640,8 +749,8 @@ above.
 |---|---|
 | NSC_Builder | Does the real job, but Windows-first, archived, GUI-oriented. The reason this project exists. |
 | `nsz` | Compress/decompress only (NSP↔NSZ, XCI↔XCZ). Not a content merger. |
-| `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta` + `--ncadir` modes are exactly what's needed — see above. |
-| `nstool` | Read/extract/verify only, no repack — used for the extraction half of the pipeline. Its own `--basenca` support turned out to need both sides' tickets simultaneously, which its single `--tik`/`--cert` flag pair can't express for base+update with different Rights IDs — `hactool` was used instead for the BKTR reconstruction step, since its `--titlekey=<raw>` + `--basenca=<plaintext nca>` combination doesn't have that limitation. |
+| `hacBrewPack` / `hacPack` (initial read) | First assumed to be homebrew-source-only (builds NCAs from romfs/exefs dirs). Turned out `hacpack`'s `--ncatype meta`/`--ncatype program` + `--ncadir` modes are exactly what's needed for building NCAs — see above. Its flat `--type nsp` container-packing role has since been replaced by this project's own `lib/pfs0.sh` (no crypto/hashing involved in that format, low risk to reimplement — see "The debugging story"), but `hacpack` is still used for the actual NCA-building steps (Meta, Program), which do involve encryption/hash-tree construction. |
+| `nstool` | Read/extract/verify only, no repack — used for the NCA/NSP extraction half of the pipeline (decrypting per-title content, which needs real key derivation this project deliberately hasn't reimplemented). Its own `--basenca` support turned out to need both sides' tickets simultaneously, which its single `--tik`/`--cert` flag pair can't express for base+update with different Rights IDs — `hactool` was used instead for the BKTR reconstruction step, since its `--titlekey=<raw>` + `--basenca=<plaintext nca>` combination doesn't have that limitation. cnmt/NACP field reading and NCA-header `RightsId` reading no longer use `nstool` at all — see `lib/binfmt.sh`/`lib/nca_header.sh`. |
 | `hactool` | Chosen for BKTR delta reconstruction (`--basenca` against a plaintext-decrypted base Program NCA) — see "The debugging story". Also used to decrypt a titlekey-crypto NCA to plaintext (`--plaintext=<file>`) as a prerequisite for that. Upstream 1.4.0 has a real, confirmed BKTR layout-validation bug (Bug #3) — this project vendors a locally-patched build in `bin/` rather than the stock release. |
 | `DarkMatterCore/nxdumptool` | Not used as a dependency, but its source was consulted directly to confirm hactool's BKTR checks are unnecessary (see Bug #3) — it successfully reads BKTR patch romfs with no equivalent pre-validation at all. |
 | `switch-merge-utility` (Rust, LordZeuss) | GUI-only, no documented CLI mode. |
@@ -716,6 +825,26 @@ above.
       (as already done for `hactool`'s BKTR bug). `hacpack`/`hactool`
       remain fully in use for NCA/NSP packing and BKTR reconstruction, for
       the same reason.
+- [x] Reduce dependency on vendored tools, second piece — implemented:
+      `lib/nca_header.sh` reads `RightsId` directly from the NCA header by
+      building AES-XTS decryption from scratch (raw AES-ECB via `openssl`
+      + hand-rolled GF(2^128) tweak math), replacing the
+      `nstool -t nca -v | grep RightsId` call site. `lib/pfs0.sh`
+      pure-bash packs the final NSP container, replacing
+      `hacpack --type nsp`. Both verified against real files (AES-XTS:
+      decrypted a real NCA header and matched `nstool`'s own `RightsId`
+      and magic; PFS0: repacked NSP is byte-for-byte identical to the
+      original `hacpack`-produced file via `cmp`). Two real bugs found and
+      fixed along the way — see Bug #4 (`openssl enc` has no XTS mode at
+      all) and Bug #5 (bash drops embedded NUL bytes from string
+      variables, corrupting the PFS0 string table) in "The debugging
+      story". **NCA content-partition decryption (AES-CTR, per-title
+      keys, hash-tree verification) and NCA-building (Meta/Program, which
+      needs to *write* those hash trees) remain on `nstool`/`hacpack`,
+      and BKTR reconstruction remains on `hactool`** — those are a
+      materially higher risk tier (a subtly wrong implementation would
+      silently produce corrupted game/save data, not a clean error) and
+      were deliberately not attempted without discussing that risk first.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**
