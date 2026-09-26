@@ -50,6 +50,20 @@ two ~3.9GB update NSPs) and surfaced two real bugs:
   (see README's roadmap). Test files live in `roms/` (kept out of the
   project root for tidiness):
 
+  **`.xci` (gamecard dump) input is also now supported**, alongside `.nsp`
+  - new `lib/hfs0.sh` (HFS0 reader, XCI's PFS0-like partition format) plus
+  `xci_split_to_nsps` in `switch-merge.sh`, which repacks an XCI's `secure`
+  partition into one synthetic NSP per title found there (a single
+  cartridge's secure partition can hold more than one independent title's
+  NCAs side by side - confirmed against a real dump). Verified against
+  three real XCI files (a real user library at `~/Downloads/switch2/`, not
+  checked into this repo) - a single-title cartridge, a two-title
+  cartridge (correctly split into two separate output NSPs with no
+  cross-contamination, each verified via `nstool -t cnmt -v` to have the
+  right TitleId/Type/content list), and a mixed XCI+NSP batch in one run.
+  See README's new "XCI: the gamecard container format" section and the
+  roadmap's "XCI input" entry for full detail.
+
 - `Dicefolk [01002A801E57C000][B/U].nsp` + `Dicefolk Chimera Pack [...][D].nsp`
 - `Super Smash Bros. Ultimate [01006A800016E000][B].nsp` + two `[01006A800016E800]`
   update NSPs (`v1966080` and `v2031616`/`Up v13.0.5`) + 99 separate
@@ -297,8 +311,11 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
    title — the "20" referred to how many separate DLC purchases/NSPs
    exist for the game in total, not how many are bundled in this one
    file. Smash Bros Ultimate's 99 DLCs are the same shape: 99 separate
-   single-title NSPs, not one bundle. XCI output was investigated and
-   explicitly decided against (see README roadmap).
+   single-title NSPs, not one bundle. XCI **output** was investigated and
+   explicitly decided against (see README roadmap) — XCI **input** is a
+   separate thing and IS implemented (see "Current state" above and
+   README's "XCI input" roadmap entry); don't conflate the two if this
+   comes up again.
 4. If a new title hits a new error, check first whether it's a variant of
    the known issues in README (BKTR delta, zero digest, hactool BKTR
    layout bug, AES-XTS mistweak, PFS0 NUL-drop, NACP language-slot

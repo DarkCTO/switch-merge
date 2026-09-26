@@ -84,6 +84,7 @@ source "$SCRIPT_DIR/lib/binfmt.sh"
 source "$SCRIPT_DIR/lib/nca_header.sh"
 source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
+source "$SCRIPT_DIR/lib/hfs0.sh"
 source "$SCRIPT_DIR/lib/romfs.sh"
 source "$SCRIPT_DIR/lib/bktr.sh"
 source "$SCRIPT_DIR/lib/romfs_build.sh"
@@ -95,6 +96,94 @@ source "$SCRIPT_DIR/lib/nca_build.sh"
 # <nsp_path>`. No decryption needed at this level.
 extract_nsp() {
     pfs0_extract_all "$1" "$2"
+}
+
+# xci_split_to_nsps <xci_path> <work_dir> <out_var_name>
+# Splits an XCI (gamecard dump) into one synthetic .nsp per title found in
+# its "secure" HFS0 partition, writing paths to the array named by
+# out_var_name (bash has no way to return an array directly). Everything
+# downstream (classify_nsp, extract_nsp, ...) treats each synthetic NSP
+# exactly like a real one - no XCI-awareness needed past this function.
+#
+# An XCI's card image holds up to five HFS0 partitions - root (a small
+# index HFS0 whose entries just point at the other four), update (a
+# SYSTEM firmware bundle, unrelated to any per-title update/Patch - not
+# read here), normal/logo (icon/branding assets, not game content - not
+# read here), and secure (every real title's own NCAs, flattened
+# together with no other file-level grouping). A cartridge can legitimately
+# carry more than one independent title's NCAs side by side in one secure
+# partition (confirmed against a real dump: two separate Application-type
+# cnmts under two different title IDs, not a base+update pair for the same
+# game - a Patch cnmt is equally possible here in principle, just not seen
+# in any sample available while building this), so this function can't
+# assume "one secure partition = one title" the way a real NSP always is.
+# Instead it finds every *.cnmt.nca in the secure partition, parses each
+# one's own cnmt to learn exactly which sibling NCAs belong to IT (the
+# same Program/Control/LegalInformation/Data content-ID fields
+# parse_cnmt already extracts for every other input path), and packs one
+# synthetic NSP per Meta NCA containing just that title's own files - so a
+# multi-title cartridge still classifies and groups correctly downstream.
+#
+# XCI card content has never been seen using titlekey/RightsId crypto in
+# any real dump checked while building this (no .tik/.cert anywhere on the
+# card - a physical cartridge has no eShop ticket to carry), so no ticket
+# handling is attempted here; a titlekey-crypto NCA on the card would just
+# fail downstream the same way one would from a malformed NSP, not
+# silently mishandled.
+xci_split_to_nsps() {
+    local xci_path="$1" work_dir="$2" out_var_name="$3"
+
+    local header_hex
+    header_hex="$(dd if="$xci_path" bs=1 skip=$((0x100)) count=4 2>/dev/null | xxd -p | tr -d '\n')"
+    [ "$header_hex" = "48454144" ] || { echo "xci_split_to_nsps: not an XCI (bad HEAD magic) in $xci_path" >&2; return 1; }
+
+    # PartitionFsHeaderAddress (u64 at 0x130) - absolute offset of the root
+    # HFS0 header. Read as hex text and byte-reversed the same way every
+    # other little-endian field in this project is (see lib/pfs0.sh's
+    # _pfs0_reverse_hex) rather than trusting dd's own count=/skip= with a
+    # literal, which silently misparses a bash 0x... literal (see
+    # lib/romfs.sh's header-read bug in README's "Reduce dependency on
+    # vendored tools, sixth piece").
+    local root_off_hex root_off
+    root_off_hex="$(dd if="$xci_path" bs=1 skip=$((0x130)) count=8 2>/dev/null | xxd -p | tr -d '\n')"
+    root_off="$((16#$(_pfs0_reverse_hex "$root_off_hex")))"
+
+    local root_dir="$work_dir/xci_root"
+    mkdir -p "$root_dir"
+    local secure_off="" name off size
+    while read -r name off size; do
+        [ "$name" = "secure" ] && secure_off=$(( $(_hfs0_data_off "$xci_path" "$root_off") + off ))
+    done < <(_hfs0_read_entries "$xci_path" "$root_off")
+    [ -n "$secure_off" ] || { echo "xci_split_to_nsps: no 'secure' partition found in $xci_path" >&2; return 1; }
+
+    local secure_dir="$work_dir/xci_secure"
+    hfs0_extract_all "$xci_path" "$secure_off" "$secure_dir" || return 1
+
+    local -a synthetic_nsps=()
+    local meta_nca title_tag=0
+    for meta_nca in "$secure_dir"/*.cnmt.nca; do
+        [ -e "$meta_nca" ] || continue
+        title_tag=$((title_tag + 1))
+
+        local cnmt_file="$work_dir/xci_${title_tag}.cnmt"
+        extract_cnmt_from_meta_nca "$meta_nca" "$cnmt_file" || { echo "  Skipping $meta_nca (cnmt extraction failed)" >&2; continue; }
+        parse_cnmt "$cnmt_file"
+
+        local -a title_files=("$meta_nca")
+        local content_id
+        for content_id in "$CNMT_PROGRAM_ID" "$CNMT_CONTROL_ID" "$CNMT_LEGALINFORMATION_ID" "$CNMT_DATA_ID"; do
+            [ -n "$content_id" ] || continue
+            [ -f "$secure_dir/$content_id.nca" ] && title_files+=("$secure_dir/$content_id.nca")
+        done
+
+        local synthetic_nsp="$work_dir/xci_${title_tag}.nsp"
+        pfs0_pack "$synthetic_nsp" "${title_files[@]}"
+        synthetic_nsps+=("$synthetic_nsp")
+    done
+    [ "${#synthetic_nsps[@]}" -gt 0 ] || { echo "xci_split_to_nsps: no *.cnmt.nca found in $xci_path's secure partition" >&2; return 1; }
+
+    local -n out_ref="$out_var_name"
+    out_ref=("${synthetic_nsps[@]}")
 }
 
 # extract_cnmt_from_meta_nca <meta_nca_path> <out_path>
@@ -174,7 +263,7 @@ OUT_DIR="$SCRIPT_DIR/merged"
 INPUTS=()
 
 usage() {
-    echo "Usage: $0 [-o <output_dir>] [-k keys.dat] [<nsp-or-dir> ...]" >&2
+    echo "Usage: $0 [-o <output_dir>] [-k keys.dat] [<nsp-or-xci-or-dir> ...]" >&2
     exit 1
 }
 
@@ -195,25 +284,41 @@ done
 command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl not found in PATH (needed by lib/nca_header.sh)" >&2; exit 1; }
 
-# Expand any directory inputs to the *.nsp files directly inside them
-# (non-recursive), and pass individual file inputs through unchanged.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Expand any directory inputs to the *.nsp/*.xci files directly inside them
+# (non-recursive), pass individual .nsp file inputs through unchanged, and
+# split each .xci (gamecard dump) input into one synthetic .nsp per title
+# found on it (xci_split_to_nsps, above) - every input from this point on
+# is a real or synthetic .nsp, so classify_nsp/extract_nsp/everything
+# downstream needs no XCI-awareness at all.
 CANDIDATE_NSPS=()
 for input in "${INPUTS[@]}"; do
     if [ -d "$input" ]; then
         while IFS= read -r -d '' f; do
             CANDIDATE_NSPS+=("$f")
         done < <(find "$input" -maxdepth 1 -iname '*.nsp' -print0)
+        while IFS= read -r -d '' f; do
+            xci_nsps=()
+            xci_split_to_nsps "$f" "$WORK" xci_nsps || { echo "  Skipping $f (XCI split failed)" >&2; continue; }
+            CANDIDATE_NSPS+=("${xci_nsps[@]}")
+        done < <(find "$input" -maxdepth 1 -iname '*.xci' -print0)
     elif [ -f "$input" ]; then
-        CANDIDATE_NSPS+=("$input")
+        case "$input" in
+            *.xci|*.XCI)
+                xci_nsps=()
+                xci_split_to_nsps "$input" "$WORK" xci_nsps || { echo "  Skipping $input (XCI split failed)" >&2; continue; }
+                CANDIDATE_NSPS+=("${xci_nsps[@]}")
+                ;;
+            *) CANDIDATE_NSPS+=("$input") ;;
+        esac
     else
         echo "Input not found: $input" >&2
         exit 1
     fi
 done
-[ "${#CANDIDATE_NSPS[@]}" -gt 0 ] || { echo "No .nsp files found in given inputs" >&2; exit 1; }
-
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+[ "${#CANDIDATE_NSPS[@]}" -gt 0 ] || { echo "No .nsp/.xci files found in given inputs" >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
 

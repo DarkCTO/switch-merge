@@ -57,17 +57,22 @@ cd hactool && git apply /path/to/bin/patches/hactool-1.4.0-bktr-layout-fix.patch
 ## Usage
 
 ```
-./switch-merge.sh [-o <output_dir>] [-k keys.dat] [<nsp-or-dir> ...]
+./switch-merge.sh [-o <output_dir>] [-k keys.dat] [<nsp-or-xci-or-dir> ...]
 ```
 
 - `-o` output directory (defaults to `merged/` next to the script itself)
 - `-k` path to keys file (defaults to `~/.switch/prod.keys`)
-- every other argument is either an individual `.nsp` file or a directory
-  (non-recursively globbed for `*.nsp` files inside it), in any order —
-  with **no** positional inputs at all, defaults to scanning the directory
-  the script itself lives in (not your current working directory), so
-  `./switch-merge.sh` with zero arguments just works: drop your base/
-  update/DLC files next to the script and run it.
+- every other argument is either an individual `.nsp`/`.xci` file or a
+  directory (non-recursively globbed for `*.nsp`/`*.xci` files inside it),
+  in any order — with **no** positional inputs at all, defaults to scanning
+  the directory the script itself lives in (not your current working
+  directory), so `./switch-merge.sh` with zero arguments just works: drop
+  your base/update/DLC files next to the script and run it. `.xci`
+  (gamecard dump) input works the same as `.nsp` — each one's "secure"
+  partition is split into one or more classifiable titles internally
+  before merging (a single cartridge can carry more than one independent
+  title's content); see "Switch content format, from scratch" below for
+  what an XCI actually contains.
 
 **No `-b`/`-u`/per-DLC flags at all.** Base, update, and DLC are
 auto-detected by reading each input NSP's own cnmt content-meta `Type`
@@ -359,6 +364,43 @@ specifically for this). This is *not* how the base's own romfs is stored —
 that one really is a complete, standalone copy — and there's no way to tell
 which kind you're looking at except checking `Enc. Type` directly.
 
+### XCI: the gamecard container format
+
+An **XCI** is a raw dump of a physical game cartridge — a different outer
+container from NSP, but holding the same underlying NCAs. Structurally:
+a small `HEAD`-magic'd header (0x100 bytes in, at file offset 0x100)
+whose `PartitionFsHeaderAddress` field points at a **root** partition,
+itself a container format called **HFS0** (HashedFs) — PFS0's hashed
+sibling: same flat header/entry-table/string-table/file-data shape, just
+with a bigger per-entry struct that adds a partial-file SHA256 (an
+on-cartridge integrity check, not needed to just read the file back out,
+and not checked by this project's own `lib/hfs0.sh` reader for the same
+reason other purely-correctness hash checks are left to `nstool`/
+`hactool` elsewhere in this project). The root HFS0's entries don't
+contain files directly — each one is itself another HFS0 partition:
+
+- **`update`** — a **system firmware** update bundle (dozens of
+  unrelated NCAs), not a per-title game update. Not read by this project.
+- **`normal`**/**`logo`** — icon/branding assets (`NintendoLogo.png`,
+  a startup movie, etc.), not game content. Not read by this project.
+- **`secure`** — every real title's own NCAs (Program/Control/
+  LegalInformation/Meta, same as an NSP holds), with no titlekey/ticket
+  crypto ever seen in practice (a physical cartridge has no eShop
+  purchase to tie a ticket to). **This is the only partition
+  `switch-merge.sh` reads.**
+
+The one thing that doesn't map cleanly onto NSP's world: a real cartridge's
+**`secure` partition can hold more than one independent title's NCAs
+flattened together**, with no further file-level grouping — confirmed
+against a real dump holding two separate `Application`-type titles under
+two different title IDs side by side (not a base+update pair for one
+game). `switch-merge.sh`'s `xci_split_to_nsps` handles this by finding
+every `*.cnmt.nca` in the extracted `secure` partition and using each
+one's own cnmt (same `parse_cnmt` used everywhere else in this project) to
+figure out which sibling NCAs belong to it, rather than assuming one
+partition is one title. See "Reduce dependency on vendored tools" roadmap
+entry "XCI input" below for the full derivation and verification.
+
 ## How it works
 
 ### The debugging story
@@ -585,8 +627,13 @@ file back with a clean, correct file tree. See `lib/pfs0.sh`.
 
 ### Pipeline (what the script does)
 
-0. Expand any directory inputs to the `.nsp` files directly inside them,
-   then classify every resulting NSP: extract just its Meta NCA (via
+0. Expand any directory inputs to the `.nsp`/`.xci` files directly inside
+   them. Each `.xci` is first split into one or more synthetic `.nsp`s (one
+   per title found in its `secure` partition — see "XCI: the gamecard
+   container format" above) via `xci_split_to_nsps`, so every input from
+   this point on is a real or synthetic NSP with no further XCI-specific
+   handling anywhere downstream. Then classify every resulting NSP: extract
+   just its Meta NCA (via
    `nstool --fstree`'s virtual-path listing, so the whole NSP doesn't need
    extracting) and read the cnmt's content-meta `Type` with this project's
    own `parse_cnmt` (`lib/binfmt.sh`) — no `nstool` call for the cnmt
@@ -1247,6 +1294,61 @@ above.
       was built and checked), not because the pipeline needs them.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
+- [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
+      input alongside `.nsp`, auto-detected by extension the same
+      zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0
+      (HashedFs), the hashed sibling of PFS0 that XCI partitions use - same
+      flat header/entry-table/string-table/file-data shape `lib/pfs0.sh`
+      already reads, just a bigger 0x40-byte entry (adds a
+      partial-file-hash field PFS0 doesn't have) - derived from
+      switchbrew's own documented XCI/HFS0 struct layout and verified
+      field-by-field against `hactool -t xci -i`'s own dump of several real
+      XCI files before trusting it. `switch-merge.sh` gained
+      `xci_split_to_nsps`, which locates the XCI's **secure** partition
+      (the one holding actual title content - the sibling **update**
+      partition is a SYSTEM firmware bundle unrelated to any per-title
+      update, and **normal**/**logo** are icon/branding assets, so none of
+      those three are read) and repacks it into one synthetic in-memory
+      `.nsp` per title found there, via the existing `pfs0_pack`. Every
+      other function (`classify_nsp`, `extract_nsp`, the whole merge
+      pipeline) needed zero changes - a synthetic NSP is byte-for-byte the
+      same shape as a real one from that point on.
+
+      The one XCI-specific wrinkle: a single cartridge's secure partition
+      can hold **more than one independent title's NCAs side by side**,
+      flattened together with no other file-level grouping - confirmed
+      against a real dump, which turned out to hold two separate
+      `Application`-type titles under two different title IDs (not a
+      base+update pair for one game). `xci_split_to_nsps` can't assume
+      "one secure partition = one title" the way a real NSP always is, so
+      it finds every `*.cnmt.nca` in the extracted secure partition first,
+      parses each one's own cnmt (`parse_cnmt`, already used everywhere
+      else in this project) to learn exactly which sibling
+      Program/Control/LegalInformation/Data NCA(s) belong to THAT title,
+      and packs one synthetic NSP per Meta NCA containing just those files
+      - so a multi-title cartridge still classifies and groups correctly
+      into separate 1G1R output NSPs, rather than one title's content
+      silently going unused or a wrong grouping being produced.
+
+      Verified end-to-end against three real XCI dumps: a single-title
+      cartridge (4 files, 1 cnmt) produced one correctly-classified,
+      correctly-named output NSP; a two-title cartridge (8 files, 2 cnmts
+      under different title IDs) produced two separate correctly-split
+      output NSPs, each `nstool --fstree`-valid (4 files: Program, Control,
+      LegalInformation, rebuilt Meta) with its own cnmt confirmed via
+      `nstool -t cnmt -v` to have the right `TitleId`/`Type`/content list
+      and no cross-contamination between the two titles' files; and mixing
+      one `.xci` input with a real `.nsp` input in the same batch run
+      produced both titles correctly in one 1G1R pass. No real XCI with a
+      titlekey-crypto (`RightsId`-bearing) NCA has been seen - a physical
+      cartridge has no eShop ticket to carry, and every sample checked
+      confirms this (no `.tik`/`.cert` anywhere on the card) - so
+      `xci_split_to_nsps` doesn't attempt ticket handling; a titlekey-crypto
+      NCA on a card would fail downstream the same way a malformed NSP
+      would, not be silently mishandled.
+
+      **Note**: this is XCI *input* only. XCI *output* remains explicitly
+      not implemented - see the entry directly below for why.
 - [x] ~~XCI output (`-f xci`)~~ — **decided against, not implemented.**
       Investigated: neither `hacpack` nor `hactool` can *write* an XCI —
       `hacpack --type` only accepts `nca`/`nsp`, and `hactool`'s XCI support
