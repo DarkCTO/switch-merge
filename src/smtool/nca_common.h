@@ -13,4 +13,11 @@
  * 0 on success, nonzero (with a message on stderr) on failure. */
 int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned char *out);
 
+/* nca_encrypt_header <header[NCA_HEADER_SIZE]> <keys_path> <out[NCA_HEADER_SIZE]>
+ * Encrypts a complete, freshly-assembled 0xC00-byte NCA header (6 XTS
+ * sectors) with the same fixed header_key every real NCA uses - the
+ * exact mirror of nca_decrypt_header, used by Phase 7/8's NCA builders.
+ * Returns 0 on success, nonzero on failure. */
+int nca_encrypt_header(const unsigned char *header, const char *keys_path, unsigned char *out);
+
 #endif

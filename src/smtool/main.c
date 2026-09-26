@@ -18,6 +18,7 @@ int cmd_tik_info(int argc, char **argv);
 int cmd_pfs0_list(int argc, char **argv);
 int cmd_pfs0_extract(int argc, char **argv);
 int cmd_pfs0_extract_all(int argc, char **argv);
+int cmd_pfs0_pack(int argc, char **argv);
 int cmd_hfs0_data_off(int argc, char **argv);
 int cmd_hfs0_list(int argc, char **argv);
 int cmd_hfs0_extract_all(int argc, char **argv);
@@ -36,6 +37,8 @@ int cmd_nca_ctr_decrypt_section(int argc, char **argv);
 int cmd_nca_hierarchical_sha256_layer(int argc, char **argv);
 int cmd_nca_hierarchical_integrity_layer(int argc, char **argv);
 int cmd_romfs_build(int argc, char **argv);
+int cmd_build_cnmt(int argc, char **argv);
+int cmd_build_meta_nca(int argc, char **argv);
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -48,6 +51,7 @@ int main(int argc, char **argv) {
             "  pfs0-list <path>\n"
             "  pfs0-extract <path> <entry_name> <out_file>\n"
             "  pfs0-extract-all <path> <out_dir>\n"
+            "  pfs0-pack <out_path> <file1> [file2] ...\n"
             "  hfs0-data-off <path> <header_offset>\n"
             "  hfs0-list <path> <header_offset>\n"
             "  hfs0-extract-all <path> <header_offset> <out_dir>\n"
@@ -65,7 +69,9 @@ int main(int argc, char **argv) {
             "  decrypt-section <nca_path> --key-hex <hex32> --ctr <hex32> --offset <N> --size <N> -o <out_path>\n"
             "  nca-hierarchical-sha256-layer <decrypted_header_file> --section <0-3>\n"
             "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n"
-            "  romfs-build <in_dir> <out_path>\n");
+            "  romfs-build <in_dir> <out_path>\n"
+            "  build-cnmt <out_path> <application|addon> <title_id_hex> <title_version> <program_or_-> <control_or_-> <legal_or_-> <data_or_->\n"
+            "  build-meta-nca <out_nca> <title_id_hex> <title_version> --keys <keys_file> [--program <nca>] [--control <nca>] [--legal <nca>] [--data <nca>] [--digest <hex64>]\n");
         return 1;
     }
 
@@ -79,6 +85,7 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "pfs0-list") == 0) return cmd_pfs0_list(sargc, sargv);
     if (strcmp(sub, "pfs0-extract") == 0) return cmd_pfs0_extract(sargc, sargv);
     if (strcmp(sub, "pfs0-extract-all") == 0) return cmd_pfs0_extract_all(sargc, sargv);
+    if (strcmp(sub, "pfs0-pack") == 0) return cmd_pfs0_pack(sargc, sargv);
     if (strcmp(sub, "hfs0-data-off") == 0) return cmd_hfs0_data_off(sargc, sargv);
     if (strcmp(sub, "hfs0-list") == 0) return cmd_hfs0_list(sargc, sargv);
     if (strcmp(sub, "hfs0-extract-all") == 0) return cmd_hfs0_extract_all(sargc, sargv);
@@ -97,6 +104,8 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "nca-hierarchical-sha256-layer") == 0) return cmd_nca_hierarchical_sha256_layer(sargc, sargv);
     if (strcmp(sub, "nca-hierarchical-integrity-layer") == 0) return cmd_nca_hierarchical_integrity_layer(sargc, sargv);
     if (strcmp(sub, "romfs-build") == 0) return cmd_romfs_build(sargc, sargv);
+    if (strcmp(sub, "build-cnmt") == 0) return cmd_build_cnmt(sargc, sargv);
+    if (strcmp(sub, "build-meta-nca") == 0) return cmd_build_meta_nca(sargc, sargv);
 
     fprintf(stderr, "smtool: unknown subcommand '%s'\n", sub);
     return 1;

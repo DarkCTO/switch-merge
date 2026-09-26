@@ -342,9 +342,24 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
    passes a `mktemp -d` path, never trailing-slashed) but worth knowing
    if `romfs_build` is ever called directly/manually again.
 
-   Remaining phases, in order: NCA builder Meta then Program (Phases
-   7-8), final cutover (Phase 9 - `smtool` becomes required, `--pure`
-   finalized as the explicit slow-path opt-in). Also
+   Phase 7 (NCA builder: Meta NCA, `nca_build.c`) also landed -
+   `build-cnmt`/`build-meta-nca`, plus `pfs0.c` gained its writer half
+   (`pfs0-pack`, deferred from Phase 1). Verified byte-for-byte against
+   bash's own two-pass digest flow AND independently against `nstool`
+   (real ground truth - confirmed the built NCA's ContentType/ProgID/
+   key-area and the embedded cnmt's own self-verifying digest, not just
+   agreement between this project's two implementations of itself). A
+   real, genuine C-port bug was caught here: an uninitialized stack
+   buffer left one reserved byte per content record as garbage,
+   corrupting every record after the first - caught immediately by the
+   very first byte-diff against real content NCAs. NOT wired into
+   `switch-merge.sh` yet - `nca_build_meta` is only called from the same
+   `merge_group` path Phase 8's Program-NCA builder also needs to
+   replace, so both land together in one cutover.
+
+   Remaining phases, in order: NCA builder Program NCA (Phase 8), final
+   cutover (Phase 9 - `smtool` becomes required, `--pure` finalized as
+   the explicit slow-path opt-in). Also
    still open within what's already landed: full BKTR *reconstruction*
    (`bktr_reconstruct` itself, as opposed to the bucket-tree parsing
    Phase 4 already ported) has NOT been ported to C yet - no real

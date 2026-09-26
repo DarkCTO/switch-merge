@@ -26,6 +26,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <libgen.h>
 
 typedef struct {
     char *name;
@@ -40,6 +41,15 @@ static uint64_t le_u64_at(const unsigned char *p) {
 }
 static uint32_t le_u32_at(const unsigned char *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void le_put_u32(unsigned char *out, uint32_t v) {
+    out[0] = (unsigned char)(v & 0xFF);
+    out[1] = (unsigned char)((v >> 8) & 0xFF);
+    out[2] = (unsigned char)((v >> 16) & 0xFF);
+    out[3] = (unsigned char)((v >> 24) & 0xFF);
+}
+static void le_put_u64(unsigned char *out, uint64_t v) {
+    for (int i = 0; i < 8; i++) out[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
 }
 
 /* Reads a PFS0 container's header+entry-table+string-table from an
@@ -196,6 +206,103 @@ int cmd_pfs0_extract(int argc, char **argv) {
     free_entries(entries, count);
     fclose(f);
     return rc;
+}
+
+/* cmd_pfs0_pack <out_path> <file1> [file2] ...
+ * Packs the given files (each contributes its own basename as its PFS0
+ * entry name) into a PFS0 container at out_path - the write-side mirror
+ * of read_pfs0_entries above, exact port of lib/pfs0.sh's pfs0_pack.
+ * String table entries are 0x20-byte aligned in total (matches
+ * hacPack's own rounding rule, confirmed necessary against real NSPs -
+ * an unpadded string table produced a file nstool misparsed). File data
+ * starts immediately after the (padded) string table, no further
+ * alignment, back-to-back in argument order - confirmed against a real
+ * NSP. */
+int cmd_pfs0_pack(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: smtool pfs0-pack <out_path> <file1> [file2] ...\n");
+        return 1;
+    }
+    const char *out_path = argv[0];
+    int file_count = argc - 1;
+    const char **files = (const char **)&argv[1];
+
+    /* basename() may modify its argument on some platforms - copy first. */
+    char **names = malloc(file_count * sizeof(char *));
+    uint64_t *sizes = malloc(file_count * sizeof(uint64_t));
+    uint32_t *str_offsets = malloc(file_count * sizeof(uint32_t));
+    uint32_t cur_str_off = 0;
+
+    for (int i = 0; i < file_count; i++) {
+        char *copy = strdup(files[i]);
+        char *base = basename(copy);
+        names[i] = strdup(base);
+        free(copy);
+
+        struct stat st;
+        if (stat(files[i], &st) != 0) {
+            fprintf(stderr, "pfs0-pack: could not stat %s\n", files[i]);
+            return 1;
+        }
+        sizes[i] = (uint64_t)st.st_size;
+
+        str_offsets[i] = cur_str_off;
+        cur_str_off += (uint32_t)strlen(names[i]) + 1;
+    }
+    uint32_t string_table_size = (cur_str_off + 0x1F) & ~0x1Fu;
+    uint32_t pad_bytes = string_table_size - cur_str_off;
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) {
+        fprintf(stderr, "pfs0-pack: could not open %s for writing\n", out_path);
+        return 1;
+    }
+
+    unsigned char header[16];
+    memcpy(header, "PFS0", 4);
+    le_put_u32(header + 4, (uint32_t)file_count);
+    le_put_u32(header + 8, string_table_size);
+    le_put_u32(header + 12, 0);
+    fwrite(header, 1, 16, out);
+
+    uint64_t data_off = 0;
+    for (int i = 0; i < file_count; i++) {
+        unsigned char entry[0x18];
+        le_put_u64(entry, data_off);
+        le_put_u64(entry + 8, sizes[i]);
+        le_put_u32(entry + 16, str_offsets[i]);
+        le_put_u32(entry + 20, 0);
+        fwrite(entry, 1, sizeof(entry), out);
+        data_off += sizes[i];
+    }
+
+    for (int i = 0; i < file_count; i++) {
+        fwrite(names[i], 1, strlen(names[i]) + 1, out); /* include NUL terminator */
+    }
+    if (pad_bytes > 0) {
+        unsigned char z = 0;
+        for (uint32_t i = 0; i < pad_bytes; i++) fwrite(&z, 1, 1, out);
+    }
+
+    for (int i = 0; i < file_count; i++) {
+        FILE *src = fopen(files[i], "rb");
+        if (!src) {
+            fprintf(stderr, "pfs0-pack: could not open %s\n", files[i]);
+            fclose(out);
+            return 1;
+        }
+        unsigned char buf[1 << 20];
+        size_t got;
+        while ((got = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, got, out);
+        fclose(src);
+    }
+
+    fclose(out);
+    for (int i = 0; i < file_count; i++) free(names[i]);
+    free(names);
+    free(sizes);
+    free(str_offsets);
+    return 0;
 }
 
 int cmd_pfs0_extract_all(int argc, char **argv) {

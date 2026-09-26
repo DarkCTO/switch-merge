@@ -21,6 +21,7 @@ source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/romfs.sh"
 source "$SCRIPT_DIR/lib/bktr.sh"
 source "$SCRIPT_DIR/lib/romfs_build.sh"
+source "$SCRIPT_DIR/lib/nca_build.sh"
 
 [ -x "$SMTOOL" ] || { echo "FAIL: $SMTOOL not found or not executable - build it first with 'make -C src/smtool'" >&2; exit 1; }
 
@@ -232,6 +233,44 @@ if [ -d "$f" ]; then
     rm -rf "$(dirname "$roundtrip_dir")"
 else
     echo "SKIP: control_romfs_dir fixture missing"
+fi
+
+# --- build-cnmt / build-meta-nca: needs real prod.keys + real NCA
+# files (control.nca fixture covers Control; Program/LegalInformation
+# NCAs aren't committed as fixtures - too large even by this project's
+# already-generous fixture standards - so this test only exercises the
+# Control-only case, still enough to catch a structural regression in
+# the header/PFS0/hash-table assembly since it's the same code path
+# regardless of how many content NCAs are given). ---
+if [ -f "$REAL_KEYS" ] && [ -f "$FIXTURES/control.nca" ]; then
+    bash_cnmt="$(mktemp)"
+    smtool_cnmt="$(mktemp)"
+    nca_build_cnmt "$bash_cnmt" application 01009c6020d1a000 0 "" "$FIXTURES/control.nca" "" ""
+    nca_build_patch_cnmt_digest "$bash_cnmt"
+    "$SMTOOL" build-cnmt "$smtool_cnmt" application 01009c6020d1a000 0 - "$FIXTURES/control.nca" - -
+    if cmp -s "$bash_cnmt" "$smtool_cnmt"; then
+        echo "PASS: build-cnmt"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: build-cnmt"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$bash_cnmt" "$smtool_cnmt"
+
+    bash_meta="$(mktemp)"
+    smtool_meta="$(mktemp)"
+    nca_build_meta "$bash_meta" "$REAL_KEYS" 01009c6020d1a000 0 "" "$FIXTURES/control.nca" "" "" ""
+    "$SMTOOL" build-meta-nca "$smtool_meta" 01009c6020d1a000 0 --keys "$REAL_KEYS" --control "$FIXTURES/control.nca"
+    if cmp -s "$bash_meta" "$smtool_meta"; then
+        echo "PASS: build-meta-nca (first pass, zero digest)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: build-meta-nca (first pass, zero digest)"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$bash_meta" "$smtool_meta"
+else
+    echo "SKIP: build-cnmt/build-meta-nca tests (no $REAL_KEYS or control.nca fixture on this machine)"
 fi
 
 # --- decrypt-section / nca-hierarchical-*-layer ---

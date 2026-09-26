@@ -74,7 +74,9 @@ static int xts_crypt_sector(int encrypt, const unsigned char key1[16], const uns
     return 0;
 }
 
-int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned char *out) {
+/* load_header_key <keys_path> <key1[16]> <key2[16]>
+ * Shared by nca_decrypt_header and nca_encrypt_header. */
+static int load_header_key(const char *keys_path, unsigned char key1[16], unsigned char key2[16]) {
     char *header_key_hex = keys_file_lookup(keys_path, "header_key", 64);
     if (!header_key_hex) {
         fprintf(stderr, "header_key not found or wrong length in %s\n", keys_path);
@@ -88,10 +90,15 @@ int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned cha
         free(header_key);
         return 1;
     }
-    unsigned char key1[16], key2[16];
     memcpy(key1, header_key, 16);
     memcpy(key2, header_key + 16, 16);
     free(header_key);
+    return 0;
+}
+
+int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned char *out) {
+    unsigned char key1[16], key2[16];
+    if (load_header_key(keys_path, key1, key2) != 0) return 1;
 
     FILE *f = fopen(nca_path, "rb");
     if (!f) {
@@ -110,6 +117,20 @@ int nca_decrypt_header(const char *nca_path, const char *keys_path, unsigned cha
         if (xts_crypt_sector(0, key1, key2, (uint64_t)sector,
                               ciphertext + sector * SECTOR_SIZE, out + sector * SECTOR_SIZE) != 0) {
             fprintf(stderr, "AES-XTS decryption failed on sector %d of %s\n", sector, nca_path);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int nca_encrypt_header(const unsigned char *header, const char *keys_path, unsigned char *out) {
+    unsigned char key1[16], key2[16];
+    if (load_header_key(keys_path, key1, key2) != 0) return 1;
+
+    for (int sector = 0; sector < NCA_HEADER_SIZE / SECTOR_SIZE; sector++) {
+        if (xts_crypt_sector(1, key1, key2, (uint64_t)sector,
+                              header + sector * SECTOR_SIZE, out + sector * SECTOR_SIZE) != 0) {
+            fprintf(stderr, "AES-XTS encryption failed on sector %d\n", sector);
             return 1;
         }
     }

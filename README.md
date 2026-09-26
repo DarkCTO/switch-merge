@@ -1563,6 +1563,55 @@ above.
       copy-paste offset mixup), which produced a same-size but
       structurally wrong container that failed to round-trip at all
       until corrected against `lib/romfs.sh`'s own documented field list.
+- [ ] **`smtool` (C port), Phase 7 of 9 — NCA builder: Meta NCA,
+      implemented.** New `src/smtool/nca_build.c` ports `lib/nca_build.sh`'s
+      cnmt-writing and Meta-NCA-assembly half: `build-cnmt` (writes a
+      `PackagedContentMeta` file — header, `Application`/`AddOnContent`
+      extended-header shape, one content record per Program/Data/
+      Control/LegalInformation NCA given, trailing digest left as a
+      zero placeholder) and `build-meta-nca` (full assembly: cnmt →
+      PFS0-pack via Phase 1's now-extended `pfs0-pack` writer →
+      per-4096-byte-block SHA256 hash table → FS header → main header →
+      AES-XTS header encryption via Phase 2's `nca_encrypt_header` (the
+      new encrypt-direction mirror of that phase's decrypt) → AES-CTR
+      content encryption of section 0, using the same primitive Phase
+      5's `decrypt-section` already uses (CTR is its own inverse)).
+      `pfs0.c` also gained the writer half (`pfs0-pack`) this phase,
+      previously deferred from Phase 1 since only the NCA-building
+      phases need it.
+
+      **Two real bugs found and fixed during verification, both caught
+      by byte-diffing against real files, not guessed**: (1) the
+      content-record buffer wasn't zero-initialized, leaving one
+      reserved byte (between the Size and ContentType fields) as
+      uninitialized stack garbage that corrupted every content record
+      after the first non-empty one — caught immediately by a `cmp`
+      mismatch against `lib/nca_build.sh`'s own output on a real title's
+      three real content NCAs (Program/Control/LegalInformation);
+      (2) confirmed (not a bug, but initially looked like one) that a
+      single-pass build correctly produces an all-zero digest — verified
+      by extracting BOTH the bash and C single-pass builds with `nstool`
+      and confirming they agree exactly (all-zero), before moving on to
+      test the real two-pass flow.
+
+      Verified end-to-end against a real title's real Program/Control/
+      LegalInformation NCAs: `build-cnmt`'s output is byte-for-byte
+      identical (`cmp`) to `lib/nca_build.sh`'s own `nca_build_cnmt`;
+      `build-meta-nca`'s two-pass flow (build once for a draft cnmt,
+      compute the real digest, rebuild with `--digest`) produces a Meta
+      NCA byte-for-byte identical to bash's own two-pass
+      `nca_build_meta` output; and, going one step further than a bash-
+      vs-C comparison alone, the built NCA was independently opened with
+      `nstool` (real ground truth, not just self-consistency between two
+      implementations of the same project) — confirmed correct
+      `ContentType: Meta`/`ProgID`/key-area decryption, and its embedded
+      cnmt was extracted and confirmed to have a genuinely correct,
+      self-verifying SHA256 digest over its own preceding bytes.
+
+      **Not wired into `switch-merge.sh` yet** — `nca_build_meta` is
+      only ever called from the same `merge_group` code path Phase 8's
+      `nca_build_program` will also need to replace, so both land
+      together in one cutover rather than partially wiring one half now.
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0
