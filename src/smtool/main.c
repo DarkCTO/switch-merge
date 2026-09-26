@@ -35,6 +35,7 @@ int cmd_bktr_subsections(int argc, char **argv);
 int cmd_nca_ctr_decrypt_section(int argc, char **argv);
 int cmd_nca_hierarchical_sha256_layer(int argc, char **argv);
 int cmd_nca_hierarchical_integrity_layer(int argc, char **argv);
+int cmd_romfs_build(int argc, char **argv);
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -63,7 +64,8 @@ int main(int argc, char **argv) {
             "  bktr-subsections <table_file>\n"
             "  decrypt-section <nca_path> --key-hex <hex32> --ctr <hex32> --offset <N> --size <N> -o <out_path>\n"
             "  nca-hierarchical-sha256-layer <decrypted_header_file> --section <0-3>\n"
-            "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n");
+            "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n"
+            "  romfs-build <in_dir> <out_path>\n");
         return 1;
     }
 
@@ -94,6 +96,7 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "decrypt-section") == 0) return cmd_nca_ctr_decrypt_section(sargc, sargv);
     if (strcmp(sub, "nca-hierarchical-sha256-layer") == 0) return cmd_nca_hierarchical_sha256_layer(sargc, sargv);
     if (strcmp(sub, "nca-hierarchical-integrity-layer") == 0) return cmd_nca_hierarchical_integrity_layer(sargc, sargv);
+    if (strcmp(sub, "romfs-build") == 0) return cmd_romfs_build(sargc, sargv);
 
     fprintf(stderr, "smtool: unknown subcommand '%s'\n", sub);
     return 1;

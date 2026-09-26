@@ -1514,6 +1514,55 @@ above.
       (`--pure`) for the same XCI merge, roughly a 4x speedup, confirming
       the honest caveat from Phase 1's own entry above (the big win was
       always expected here, not in the small struct-parsing phases).
+- [ ] **`smtool` (C port), Phase 6 of 9 — RomFs writer, implemented.**
+      New `src/smtool/romfs_build.c` ports `lib/romfs_build.sh` (itself a
+      port of hacpack's own `romfs_build`) — full directory-tree walk,
+      the same TWO different sort orderings the bash version draws
+      (global "next" order for entry-offset/file-partition-offset/hash-
+      table assignment, separate per-parent "sibling" order for the
+      actual child/file/sibling linked-list structure), the custom
+      `calc_path_hash` function, and `romfs_get_hash_table_count`'s
+      odd-bucket-count-avoiding-small-primes sizing rule. **Not wired
+      into `switch-merge.sh`** this phase — `romfs_build` is only ever
+      called from `lib/nca_build.sh`'s `nca_build_program`, which isn't
+      itself ported until Phase 8; wiring `op_romfs_build` in now would
+      mean `lib/nca_build.sh` calling a wrapper that only exists in
+      `switch-merge.sh`'s own scope for one sub-step of a bash function
+      that isn't ported yet. `romfs-build` exists and is fully verified
+      standalone now so Phase 8 can call it in-process directly (no
+      subprocess spawn at all at that point, not even the one this
+      phase's own subcommand still needs).
+
+      **Real bug found and fixed during verification, unrelated to the
+      C port**: testing bash's own `romfs_build` against a real
+      directory tree initially produced `printf: : invalid number`
+      errors and a corrupted, non-round-trippable output — traced to
+      `romfs_build`'s own `sed "s|^$in_dir||"` prefix-stripping breaking
+      when `in_dir` is passed WITH a trailing slash (an undocumented
+      input constraint: every real call site in this project, via
+      `nca_build_program`, always passes a `mktemp -d` path with no
+      trailing slash, so this never surfaces in the actual pipeline —
+      only in ad-hoc manual testing during this phase's own
+      verification). Confirmed by re-testing without the trailing slash:
+      bash's output then matched `smtool romfs-build`'s own output
+      byte-for-byte exactly.
+
+      Verified two ways against a real directory tree (a real Control
+      NCA's extracted icons + `control.nacp`, checked into
+      `tests/fixtures/control_romfs_dir/`): (1) byte-for-byte identical
+      build output (`cmp`) against `lib/romfs_build.sh`'s own bash
+      implementation; (2) round-tripped the C-built container back
+      through Phase 4's already-verified `romfs-extract-all` and
+      `diff -r`'d against the original directory — this catches
+      structural bugs a byte-diff against a possibly-also-wrong bash
+      build might not, since it validates against an independently-
+      verified reader instead. This round-trip test is what caught a
+      real bug in the C port itself before it ever shipped: an initial
+      version wrote `DirHashTableOffset`/`DirHashTableSize` at the
+      `DirTableOffset`/`DirTableSize` header field positions (a
+      copy-paste offset mixup), which produced a same-size but
+      structurally wrong container that failed to round-trip at all
+      until corrected against `lib/romfs.sh`'s own documented field list.
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0

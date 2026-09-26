@@ -325,9 +325,26 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
    this from scratch if picking the work back up — it's already
    confirmed working and fast for the phases that landed.
 
-   Remaining phases, in order: RomFs writer (Phase 6), NCA builder Meta
-   then Program (Phases 7-8), final cutover (Phase 9 - `smtool` becomes
-   required, `--pure` finalized as the explicit slow-path opt-in). Also
+   Phase 6 (RomFs writer, `romfs_build.c`) also landed - verified
+   byte-for-byte against bash AND via round-trip through Phase 4's
+   extractor against a real directory tree (`tests/fixtures/
+   control_romfs_dir/`). NOT wired into `switch-merge.sh` yet - it's
+   only ever called from `lib/nca_build.sh`'s `nca_build_program`, not
+   itself ported until Phase 8, so wiring an `op_romfs_build` now would
+   mean that bash file calling a wrapper living in `switch-merge.sh`'s
+   own scope for one sub-step of a function that isn't C yet. Phase 8
+   will call the C romfs-build logic in-process directly once it ports
+   `nca_build_program` in full. **Also found and fixed a real,
+   pre-existing bash bug unrelated to the C port** while verifying this
+   phase: `lib/romfs_build.sh`'s own `romfs_build` breaks (corrupted,
+   non-round-trippable output) if `in_dir` is passed WITH a trailing
+   slash - never surfaces in the real pipeline (every real call site
+   passes a `mktemp -d` path, never trailing-slashed) but worth knowing
+   if `romfs_build` is ever called directly/manually again.
+
+   Remaining phases, in order: NCA builder Meta then Program (Phases
+   7-8), final cutover (Phase 9 - `smtool` becomes required, `--pure`
+   finalized as the explicit slow-path opt-in). Also
    still open within what's already landed: full BKTR *reconstruction*
    (`bktr_reconstruct` itself, as opposed to the bucket-tree parsing
    Phase 4 already ported) has NOT been ported to C yet - no real

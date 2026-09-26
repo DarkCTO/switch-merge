@@ -20,6 +20,7 @@ source "$SCRIPT_DIR/lib/nca_header.sh"
 source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/romfs.sh"
 source "$SCRIPT_DIR/lib/bktr.sh"
+source "$SCRIPT_DIR/lib/romfs_build.sh"
 
 [ -x "$SMTOOL" ] || { echo "FAIL: $SMTOOL not found or not executable - build it first with 'make -C src/smtool'" >&2; exit 1; }
 
@@ -194,6 +195,44 @@ fi
 # checkout with no keys still gets full coverage of every fixture that
 # doesn't need one.
 REAL_KEYS="$HOME/.switch/prod.keys"
+
+# --- romfs-build: real flat directory tree (a real Control NCA's
+# extracted icons + control.nacp - no subdirectories, but every real
+# name/size this format needs to handle). Two checks: (1) byte-for-byte
+# identical build output against lib/romfs_build.sh's own bash
+# implementation, (2) round-trip through the already-verified
+# romfs-extract-all and diff against the original directory - this
+# catches structural bugs (e.g. a wrong header field offset) that a
+# byte-diff against a POSSIBLY-ALSO-WRONG bash build might not, since it
+# validates against the independently-verified reader instead. ---
+f="$FIXTURES/control_romfs_dir"
+if [ -d "$f" ]; then
+    bash_build="$(mktemp -u).bin"
+    smtool_build="$(mktemp -u).bin"
+    romfs_build "$f" "$bash_build" >/dev/null
+    "$SMTOOL" romfs-build "$f" "$smtool_build" >/dev/null
+    if cmp -s "$bash_build" "$smtool_build"; then
+        echo "PASS: romfs-build (byte-identical vs bash)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: romfs-build (byte-identical vs bash)"
+        FAIL=$((FAIL + 1))
+    fi
+
+    roundtrip_dir="$(mktemp -d)/out"
+    "$SMTOOL" romfs-extract-all "$smtool_build" "$roundtrip_dir"
+    if diff -rq "$f" "$roundtrip_dir" >/dev/null 2>&1; then
+        echo "PASS: romfs-build (round-trip content matches original directory)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: romfs-build (round-trip content matches original directory)"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$bash_build" "$smtool_build"
+    rm -rf "$(dirname "$roundtrip_dir")"
+else
+    echo "SKIP: control_romfs_dir fixture missing"
+fi
 
 # --- decrypt-section / nca-hierarchical-*-layer ---
 if [ -f "$REAL_KEYS" ]; then
