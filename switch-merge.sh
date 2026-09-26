@@ -16,22 +16,17 @@
 # stop the others.
 set -euo pipefail
 
-# Prefer the vendored copies of hacpack/hactool in ./bin (relative to this
-# script's own location, not the caller's cwd) over any system-wide
-# install, so the project is self-contained and doesn't depend on whatever
-# version happens to be on PATH. Falls back to PATH if ./bin doesn't have
-# them (e.g. a fresh checkout without the binaries vendored in yet).
-# ./bin/hactool specifically carries a local fix for two real, confirmed
-# bugs in upstream hactool 1.4.0's BKTR (patch-romfs) layout validation that
-# reject some legitimate update NCAs ("Invalid BKTR layout!" / silently
-# empty romfs extraction) - see README's "The debugging story" for the
-# investigation and exact patch. Do not casually swap this back to a
-# system/AUR hactool without re-checking that fix is still needed/applied.
-# nstool is no longer required at all (see below) but bin/nstool is left
-# vendored/on PATH here too, harmlessly, in case it's ever useful for
-# manual debugging (nstool -t nca -v's human-readable dumps were used
-# throughout this project's own development to verify the pure-bash code
-# against).
+# Prefer the vendored copy of hacpack in ./bin (relative to this script's
+# own location, not the caller's cwd) over any system-wide install, so the
+# project is self-contained and doesn't depend on whatever version happens
+# to be on PATH. Falls back to PATH if ./bin doesn't have it (e.g. a fresh
+# checkout without the binary vendored in yet). nstool and hactool are no
+# longer required at all by the pipeline (see below) but both are left
+# vendored/on PATH here too, harmlessly, in case they're ever useful for
+# manual debugging (their human-readable dumps and hactool's own
+# --basenca reconstruction were used throughout this project's own
+# development to verify the pure-bash code against - see lib/bktr.sh's
+# header comment for the BKTR-reconstruction verification specifically).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SCRIPT_DIR/bin" ]; then
     PATH="$SCRIPT_DIR/bin:$PATH"
@@ -40,37 +35,43 @@ fi
 # Pure-bash cnmt/NACP/ticket binary parsers (lib/binfmt.sh), NCA header
 # AES-XTS decryption (lib/nca_header.sh), per-title NCA content-key
 # derivation and AES-CTR content decryption (lib/nca_content.sh), PFS0/NSP
-# container packing+unpacking (lib/pfs0.sh), and RomFs file-table reading
-# (lib/romfs.sh) - together these eliminate the dependency on nstool
-# entirely (see extract_nsp/extract_cnmt_from_meta_nca/
-# extract_nacp_from_control_nca below - every remaining nstool -x/-t nca -x
-# call site this project ever had is now one of these three functions).
-# See README's "The debugging story" and "Reduce dependency on vendored
-# tools" roadmap entries for how these were derived and verified against
-# nstool's/hacpack's own output on real files (including several real bugs
-# found and fixed along the way: bash silently drops embedded NUL bytes
-# from string variables, which broke the PFS0 string table's null-
+# container packing+unpacking (lib/pfs0.sh), RomFs file-table reading
+# (lib/romfs.sh), and BKTR (patch-romfs) reconstruction (lib/bktr.sh) -
+# together these eliminate the dependency on nstool AND hactool entirely
+# (see extract_nsp/extract_cnmt_from_meta_nca/extract_nacp_from_control_nca
+# below for the nstool replacements, and the BKTR-reconstruction branch of
+# merge_group further down for the hactool replacement - every
+# nstool/hactool call site this project ever had is now pure bash). See
+# README's "The debugging story" and "Reduce dependency on vendored tools"
+# roadmap entries for how these were derived and verified against nstool's/
+# hacpack's/hactool's own output on real files (including several real
+# bugs found and fixed along the way: bash silently drops embedded NUL
+# bytes from string variables, which broke the PFS0 string table's null-
 # terminated filenames until file writes were changed to stream NULs
 # directly via printf instead of building a combined string first; a
 # `while read ... done < <(...)` process substitution runs in a subshell,
 # so a variable the piped function sets as a side effect is invisible back
 # in the loop body - lib/pfs0.sh's data-offset lookup hit this and now
 # returns its result via a dedicated function call instead of a global;
-# and GNU dd's count=/skip= flags do NOT accept a bash-style 0x... hex
-# literal - lib/romfs.sh's header read silently got a `count=0` this way
-# until the literal was wrapped in `$(( ))` first). NCA content-partition
-# hash-tree verification, NCA *building* (Meta/Program - which needs to
-# write hash trees, not just read them), and BKTR reconstruction still go
-# through the vendored hacpack/hactool, since those involve hash-tree
-# verification/construction and BKTR bucket-tree parsing where a subtly
-# wrong from-scratch implementation would silently produce corrupted
-# output rather than a clean error - not worth that risk for what's
-# already working, tested, patched-where-needed tooling.
+# GNU dd's count=/skip= flags do NOT accept a bash-style 0x... hex literal
+# - lib/romfs.sh's header read silently got a `count=0` this way until the
+# literal was wrapped in `$(( ))` first; and the BKTR relocation/
+# subsection bucket-tree layout is NOT documented anywhere online, in this
+# much detail, in switchbrew's wiki or elsewhere - lib/bktr.sh's struct
+# offsets were derived directly from vendored bin/hactool's own C source
+# instead of guessed, then verified against real files). NCA content-
+# partition hash-tree verification and NCA *building* (Meta/Program -
+# which needs to write hash trees, not just read them) still go through
+# the vendored hacpack, since that involves hash-tree verification/
+# construction where a subtly wrong from-scratch implementation would
+# silently produce corrupted output rather than a clean error - not worth
+# that risk for what's already working, tested tooling.
 source "$SCRIPT_DIR/lib/binfmt.sh"
 source "$SCRIPT_DIR/lib/nca_header.sh"
 source "$SCRIPT_DIR/lib/nca_content.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
 source "$SCRIPT_DIR/lib/romfs.sh"
+source "$SCRIPT_DIR/lib/bktr.sh"
 
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
@@ -176,7 +177,6 @@ done
 [ "${#INPUTS[@]}" -gt 0 ] || INPUTS=("$SCRIPT_DIR")
 [ -f "$KEYS" ] || { echo "Keys file not found: $KEYS" >&2; exit 1; }
 command -v hacpack >/dev/null || { echo "hacpack not found in PATH" >&2; exit 1; }
-command -v hactool >/dev/null || { echo "hactool not found in PATH" >&2; exit 1; }
 command -v xxd >/dev/null || { echo "xxd not found in PATH (needed by lib/binfmt.sh; ships with vim/vim-common)" >&2; exit 1; }
 command -v openssl >/dev/null || { echo "openssl not found in PATH (needed by lib/nca_header.sh)" >&2; exit 1; }
 
@@ -394,10 +394,12 @@ merge_group() {
         BASE_PROGRAM_SRC="$(find "$BASE_DIR" -maxdepth 1 -iname "${BASE_PROGRAM_NCA_ID}.nca" | head -n1)"
 
         # Pull each side's raw (still ticket-encrypted) titlekey via
-        # parse_tik (lib/binfmt.sh, pure bash, no nstool call). This is
-        # the value hactool's --titlekey wants - not the same as the
-        # fully-decrypted AES-CTR content key nstool prints in its own
-        # verbose NCA dump.
+        # parse_tik (lib/binfmt.sh, pure bash, no nstool call). This feeds
+        # nca_content_key_titlekey (lib/nca_content.sh) below to derive the
+        # actual AES-CTR content key - not the same as the raw
+        # ticket-encrypted value itself, and not the same as nstool's own
+        # verbose-dump "AES-CTR Key" either (that one needs the ticket
+        # already resolved, which is exactly what this step is for).
         local extract_ticket_titlekey
         extract_ticket_titlekey() {
             local dir="$1"
@@ -413,21 +415,71 @@ merge_group() {
         [ -n "$BASE_TITLEKEY" ] || { echo "[$title_id] Could not extract base titlekey" >&2; exit 1; }
         [ -n "$UPDATE_TITLEKEY" ] || { echo "[$title_id] Could not extract update titlekey" >&2; exit 1; }
 
-        # hactool's --basenca needs a base NCA it can read without a second
-        # key context, so decrypt the base Program NCA to plaintext first.
-        local BASE_PLAINTEXT_NCA="$GROUP_WORK/base_program_plaintext.nca"
-        hactool -k "$KEYS" --titlekey="$BASE_TITLEKEY" \
-            --plaintext="$BASE_PLAINTEXT_NCA" \
-            "$BASE_PROGRAM_SRC" >/dev/null 2>&1
+        # Find each side's romfs section number (BKTR/CtrEx on the update,
+        # plain AesCtr on the base - see lib/bktr.sh's header comment for
+        # why the base doesn't need any BKTR-aware handling, just an
+        # ordinary section decrypt) and the update's own exefs section
+        # number (also plain AesCtr - only the romfs half is ever a BKTR
+        # delta, confirmed on both this project's test titles).
+        local sec base_romfs_section=-1 update_romfs_section=-1 update_exefs_section=-1
+        for sec in 0 1 2 3; do
+            nca_section_info "$BASE_PROGRAM_SRC" "$KEYS" "$sec"
+            [ "$NCA_SECTION_PRESENT" = "1" ] && [ "$NCA_SECTION_CRYPT_TYPE" = "3" ] && base_romfs_section="$sec"
+        done
+        for sec in 0 1 2 3; do
+            nca_section_info "$PRIMARY_PROGRAM_SRC" "$KEYS" "$sec"
+            if [ "$NCA_SECTION_PRESENT" = "1" ]; then
+                [ "$NCA_SECTION_CRYPT_TYPE" = "4" ] && update_romfs_section="$sec"
+                [ "$NCA_SECTION_CRYPT_TYPE" = "3" ] && update_exefs_section="$sec"
+            fi
+        done
+        [ "$base_romfs_section" -ge 0 ] || { echo "[$title_id] Could not find base Program NCA's romfs section" >&2; exit 1; }
+        [ "$update_romfs_section" -ge 0 ] || { echo "[$title_id] Could not find update Program NCA's BKTR romfs section" >&2; exit 1; }
+        [ "$update_exefs_section" -ge 0 ] || { echo "[$title_id] Could not find update Program NCA's exefs section" >&2; exit 1; }
+
+        # Decrypt the base's own romfs section directly - no need for
+        # hactool --plaintext's non-standard intermediate NCA container at
+        # all, lib/bktr.sh's bktr_reconstruct only needs the base's raw
+        # decrypted romfs section bytes (see that file's own header
+        # comment on why hactool's --basenca input is just indexed by
+        # plain byte offset once decrypted, nothing NCA-container-specific
+        # about it).
+        local BASE_ROMFS_DECRYPTED="$GROUP_WORK/base_romfs_decrypted.bin"
+        nca_section_info "$BASE_PROGRAM_SRC" "$KEYS" "$base_romfs_section"
+        local base_key
+        base_key="$(nca_content_key_titlekey "$BASE_TITLEKEY" "$(nca_crypto_type "$BASE_PROGRAM_SRC" "$KEYS")" "$KEYS")"
+        nca_ctr_decrypt_section "$BASE_PROGRAM_SRC" "$base_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$BASE_ROMFS_DECRYPTED" || exit 1
+
+        # Reconstruct the update's full virtual romfs (lib/bktr.sh, pure
+        # bash - see that file's header comment for the relocation/
+        # subsection bucket-tree walk this replaces hactool --basenca
+        # with), then extract both it and the update's own (non-BKTR)
+        # exefs section into real directory trees, since hacpack's
+        # --exefsdir/--romfsdir below want directories, not raw blobs.
+        local update_key
+        update_key="$(nca_content_key_titlekey "$UPDATE_TITLEKEY" "$(nca_crypto_type "$PRIMARY_PROGRAM_SRC" "$KEYS")" "$KEYS")"
+        local RECON_ROMFS_BLOB="$GROUP_WORK/recon_romfs_blob.bin"
+        bktr_reconstruct "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_key" "$update_romfs_section" "$BASE_ROMFS_DECRYPTED" "$RECON_ROMFS_BLOB" || exit 1
+        rm -f "$BASE_ROMFS_DECRYPTED"
 
         local RECON_EXEFS="$GROUP_WORK/recon_exefs"
         local RECON_ROMFS="$GROUP_WORK/recon_romfs"
-        mkdir -p "$RECON_EXEFS" "$RECON_ROMFS"
-        hactool -k "$KEYS" --titlekey="$UPDATE_TITLEKEY" \
-            --basenca="$BASE_PLAINTEXT_NCA" \
-            --exefsdir="$RECON_EXEFS" \
-            --romfsdir="$RECON_ROMFS" \
-            "$PRIMARY_PROGRAM_SRC" >/dev/null
+        read -r romfs_data_off romfs_data_size <<< "$(nca_hierarchical_integrity_data_layer "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_romfs_section")"
+        local RECON_ROMFS_DATA="$GROUP_WORK/recon_romfs_data.bin"
+        tail -c +$((romfs_data_off + 1)) "$RECON_ROMFS_BLOB" | head -c "$romfs_data_size" > "$RECON_ROMFS_DATA"
+        rm -f "$RECON_ROMFS_BLOB"
+        romfs_extract_all "$RECON_ROMFS_DATA" "$RECON_ROMFS"
+        rm -f "$RECON_ROMFS_DATA"
+
+        nca_section_info "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_exefs_section"
+        local EXEFS_SECTION_BIN="$GROUP_WORK/exefs_section.bin"
+        nca_ctr_decrypt_section "$PRIMARY_PROGRAM_SRC" "$update_key" "$NCA_SECTION_CTR" "$NCA_SECTION_OFFSET" "$NCA_SECTION_SIZE" "$EXEFS_SECTION_BIN" || exit 1
+        read -r exefs_data_off exefs_data_size <<< "$(nca_hierarchical_sha256_data_layer "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_exefs_section")"
+        local EXEFS_PFS0="$GROUP_WORK/exefs_pfs0.bin"
+        tail -c +$((exefs_data_off + 1)) "$EXEFS_SECTION_BIN" | head -c "$exefs_data_size" > "$EXEFS_PFS0"
+        rm -f "$EXEFS_SECTION_BIN"
+        pfs0_extract_all "$EXEFS_PFS0" "$RECON_EXEFS"
+        rm -f "$EXEFS_PFS0"
 
         echo "==> [$title_id] Rebuilding standalone (non-titlekey) Program NCA from reconstructed content"
         local PROGRAM_BUILD_DIR="$GROUP_WORK/program_build"

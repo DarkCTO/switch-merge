@@ -117,3 +117,89 @@ romfs_extract() {
     echo "romfs_extract: entry '$entry_name' not found in $romfs_file" >&2
     return 1
 }
+
+# romfs_extract_all <romfs_file> <out_dir>
+# Extracts the FULL directory tree (unlike romfs_extract, which only does
+# a flat root-directory lookup by name - see that function's own comment
+# for why the flat version was enough for this project's other use case,
+# Control NCA -> control.nacp). Needed for BKTR-reconstructed romfs
+# content (see lib/bktr.sh), which hacpack's --romfsdir wants as a real
+# directory tree on disk, not a raw blob.
+#
+# Layout reference (switchbrew.org/wiki/RomFS's RomFsDirectoryEntry,
+# confirmed against a real BKTR-reconstructed romfs blob's own directory
+# table, byte-for-byte matching the directory tree nstool independently
+# extracted the same content into - Data/Managed/{Metadata,Resources},
+# Data/Resources, Data/StreamingAssets/aa/{AddressablesLink,Switch}):
+#   RomFsDirectoryEntry (variable size, same padding-to-4-bytes rule as
+#   RomFsFileEntry):
+#     +0x00 (0x4) ParentDirOffset
+#     +0x04 (0x4) NextSiblingOffset  (0xFFFFFFFF = no more siblings)
+#     +0x08 (0x4) FirstChildOffset   (0xFFFFFFFF = no subdirectories)
+#     +0x0C (0x4) FirstFileOffset    (0xFFFFFFFF = no files)
+#     +0x10 (0x4) NextDirHashOffset  (not read - hash table not used)
+#     +0x14 (0x4) NameLength
+#     +0x18 (NameLength bytes, padded to a multiple of 4) Name
+# RomFsFileEntry's own NextSiblingOffset (already read by romfs_extract's
+# per-entry walk, just not used there since that function doesn't need
+# more than one file per lookup) is what lets multiple files hang off one
+# directory's FirstFileOffset here.
+romfs_extract_all() {
+    local romfs_file="$1" out_dir="$2"
+
+    local hdr_hex
+    hdr_hex="$(dd if="$romfs_file" bs=1 count=$((0x50)) 2>/dev/null | xxd -p | tr -d '\n')"
+    local dir_table_off dir_table_size file_table_off file_table_size data_base_off
+    dir_table_off="$((16#$(_romfs_reverse_hex "${hdr_hex:48:16}")))"
+    dir_table_size="$((16#$(_romfs_reverse_hex "${hdr_hex:64:16}")))"
+    file_table_off="$((16#$(_romfs_reverse_hex "${hdr_hex:112:16}")))"
+    file_table_size="$((16#$(_romfs_reverse_hex "${hdr_hex:128:16}")))"
+    data_base_off="$((16#$(_romfs_reverse_hex "${hdr_hex:144:16}")))"
+
+    local dir_hex file_hex
+    dir_hex="$(dd if="$romfs_file" bs=1M skip="$dir_table_off" count="$dir_table_size" iflag=skip_bytes,count_bytes 2>/dev/null | xxd -p | tr -d '\n')"
+    file_hex="$(dd if="$romfs_file" bs=1M skip="$file_table_off" count="$file_table_size" iflag=skip_bytes,count_bytes 2>/dev/null | xxd -p | tr -d '\n')"
+
+    _romfs_extract_dir "$romfs_file" "$dir_hex" "$file_hex" 0 "$out_dir" "$data_base_off"
+}
+
+# _romfs_extract_dir <romfs_file> <dir_table_hex> <file_table_hex> <dir_entry_offset> <out_dir> <data_base_off>
+# Recursive helper for romfs_extract_all: writes every file directly under
+# the directory entry at dir_entry_offset to out_dir, then recurses into
+# every subdirectory (each becoming its own out_dir/<name>/).
+_romfs_extract_dir() {
+    local romfs_file="$1" dir_hex="$2" file_hex="$3" dir_off="$4" out_dir="$5" data_base_off="$6"
+    mkdir -p "$out_dir"
+
+    local entry_off=$(( dir_off * 2 ))
+    local first_child first_file
+    first_child="$((16#$(_romfs_reverse_hex "${dir_hex:$((entry_off + 16)):8}")))"
+    first_file="$((16#$(_romfs_reverse_hex "${dir_hex:$((entry_off + 24)):8}")))"
+
+    local file_off name_len name_hex name data_off data_size next_sib
+    while [ "$first_file" != "4294967295" ]; do
+        file_off=$(( first_file * 2 ))
+        data_off="$((16#$(_romfs_reverse_hex "${file_hex:$((file_off + 16)):16}")))"
+        data_size="$((16#$(_romfs_reverse_hex "${file_hex:$((file_off + 32)):16}")))"
+        name_len="$((16#$(_romfs_reverse_hex "${file_hex:$((file_off + 56)):8}")))"
+        name_hex="${file_hex:$((file_off + 64)):$((name_len * 2))}"
+        name="$(hex_to_text "$name_hex")"
+        dd if="$romfs_file" of="$out_dir/$name" bs=1M skip=$(( data_base_off + data_off )) count="$data_size" iflag=skip_bytes,count_bytes 2>/dev/null
+
+        next_sib="$((16#$(_romfs_reverse_hex "${file_hex:$((file_off + 8)):8}")))"
+        first_file="$next_sib"
+    done
+
+    local child_off name_len2 name_hex2 name2 next_sib_dir
+    child_off="$first_child"
+    while [ "$child_off" != "4294967295" ]; do
+        entry_off=$(( child_off * 2 ))
+        name_len2="$((16#$(_romfs_reverse_hex "${dir_hex:$((entry_off + 40)):8}")))"
+        name_hex2="${dir_hex:$((entry_off + 48)):$((name_len2 * 2))}"
+        name2="$(hex_to_text "$name_hex2")"
+        _romfs_extract_dir "$romfs_file" "$dir_hex" "$file_hex" "$child_off" "$out_dir/$name2" "$data_base_off"
+
+        next_sib_dir="$((16#$(_romfs_reverse_hex "${dir_hex:$((entry_off + 8)):8}")))"
+        child_off="$next_sib_dir"
+    done
+}

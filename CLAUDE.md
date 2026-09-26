@@ -41,47 +41,51 @@ batch mode**: a directory mixing several different games' base/update/DLC
 files together merges each into its own output NSP in one run, one merge
 per group, failures in one group don't stop the others.
 
-**The project is self-contained**: `hacpack`/`hactool` (and `nstool`,
-still vendored for manual debugging even though the pipeline no longer
-calls it — see below) live in `bin/`, which the script puts first on
-`PATH` automatically. No system package install needed, and `bin/hactool`
-specifically carries a local fix for a real upstream bug (see below) that
-the system/AUR version doesn't have. **`nstool` is no longer called by
-the merge pipeline at all** — confirmed by temporarily replacing
-`bin/nstool` with a wrapper that fails loudly if invoked and re-running a
-full 1G1R batch merge of both test titles end-to-end; it never fired.
-Everything is pure bash: `lib/binfmt.sh` reads cnmt/NACP/`.tik` directly,
-`lib/nca_header.sh` decrypts just the NCA header (AES-XTS, built from raw
+**The project is self-contained**: `hacpack` (the only tool the pipeline
+still calls — `nstool`/`hactool` remain vendored purely for manual
+debugging/cross-verification, see below) lives in `bin/`, which the
+script puts first on `PATH` automatically. No system package install
+needed. **Both `nstool` and `hactool` are fully eliminated from the merge
+pipeline** — confirmed for each by temporarily replacing its vendored
+`bin/` binary with a wrapper that fails loudly if invoked and re-running a
+full 1G1R batch merge of both test titles end-to-end; neither ever fired.
+Everything except final NCA/hash-tree building is pure bash:
+`lib/binfmt.sh` reads cnmt/NACP/`.tik` directly, `lib/nca_header.sh`
+decrypts just the NCA header (AES-XTS, built from raw
 `openssl enc -aes-128-ecb` since `openssl enc` has no XTS mode of its own)
 to read `RightsId`, `lib/nca_content.sh` derives per-title content keys
 (AES-128-ECB unwrap of the header's key area, or of a ticket's titlekey
 via `titlekek_<gen>`) and decrypts a content section via one
 `openssl enc -aes-128-ctr` call, `lib/pfs0.sh` both packs AND unpacks
-PFS0 containers (`pfs0_extract`/`pfs0_extract_all`), and `lib/romfs.sh`
-does a flat, root-directory-only RomFs file lookup (just enough to pull
-`control.nacp` out of a Control NCA) — `switch-merge.sh`'s own
-`extract_nsp`/`extract_cnmt_from_meta_nca`/`extract_nacp_from_control_nca`
-combine these to replace every single `nstool` call site the pipeline
-ever had. All verified byte-for-byte against `nstool`'s own output on real
-files (standard-crypto and titlekey-crypto NCAs, both test titles' full
-1G1R batch merge re-run end-to-end and `cmp`'d against the previously
-hardware-tested outputs) — see README roadmap's "fourth" through "sixth
-piece" entries for the full verification detail and the real bugs found
-while wiring this in (a `dd bs=1` performance trap on large files, a `cut
--d $'\0'` NUL-handling corruption, a process-substitution subshell
-variable-scoping bug, and GNU `dd`'s `count=`/`skip=` not accepting a
-bash-style `0x...` hex literal directly). `lib/nca_content.sh` deliberately
-does not handle `AesCtrEx`/BKTR sections or hash-tree verification, and
-`lib/romfs.sh` deliberately does not walk subdirectories (every real
-Control NCA seen so far has every file flat in the root). Everything
-involving actual NCA content-partition hash-tree verification, NCA
-*building* (Meta/Program — which needs to write hash trees, not just read
-them), and BKTR reconstruction still goes through the vendored
-`hacpack`/`hactool` — reimplementing that from scratch risks silent data
-corruption on a subtle bug, which isn't worth it given these tools are
-already open-source and locally patchable (see the hactool BKTR fix below)
-when something's
-actually wrong with them.
+PFS0 containers (`pfs0_extract`/`pfs0_extract_all`), `lib/romfs.sh` reads
+RomFs content both as a flat root-only lookup (`romfs_extract`, for
+Control NCA → `control.nacp`) and as a full recursive directory-tree
+extraction (`romfs_extract_all`, for BKTR-reconstructed content), and
+`lib/bktr.sh` reimplements BKTR (patch-romfs) delta reconstruction —
+`switch-merge.sh`'s own `extract_nsp`/`extract_cnmt_from_meta_nca`/
+`extract_nacp_from_control_nca` plus the BKTR-reconstruction branch of
+`merge_group` combine all of this to replace every `nstool`/`hactool`
+call site the pipeline ever had. All verified byte-for-byte against real
+tool output (`nstool`'s dumps for the smaller pieces; `hactool
+--basenca`'s own reconstruction, diffed recursively with `diff -rq`, for
+BKTR specifically) and by re-running the full 1G1R batch merge end-to-end
+— see README roadmap's "fourth" through "seventh piece" entries for full
+verification detail and the real bugs found along the way (a `dd bs=1`
+performance trap on large files, a `cut -d $'\0'` NUL-handling corruption,
+a process-substitution subshell variable-scoping bug, GNU `dd`'s
+`count=`/`skip=` not accepting a bash-style `0x...` hex literal directly,
+and a stale byte-offset assumption in `hactool`'s own BKTR superblock
+struct comment that didn't match real files). BKTR's own relocation/
+subsection bucket-tree format is genuinely undocumented anywhere online —
+`lib/bktr.sh`'s layout was derived directly from vendored `bin/hactool`
+1.4.0's own C source, not guessed. **Only `hacpack` remains required** —
+NCA *building* (writing hash trees, not just reading them, for the merged
+Meta NCA and the BKTR-rebuilt standalone Program NCA) is the one
+deliberately-untouched piece: a subtly wrong from-scratch hash-tree writer
+could produce a file that installs but is silently corrupted at runtime,
+a fundamentally different risk than everything else, which either fails
+loudly on a wrong read or was checked byte-for-byte against a known-good
+reference before running unsupervised.
 
 ## Non-obvious things worth remembering
 
