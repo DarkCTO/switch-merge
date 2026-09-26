@@ -10,6 +10,12 @@
 # hacpack's own auto-generated build-cache backups.
 /hacpack_backup/
 
+# smtool is built from src/smtool/ via 'make -C src/smtool' - the source
+# is committed, the compiled binary and object files are not (same
+# convention as any other project: build output isn't source).
+/bin/smtool
+/src/smtool/*.o
+
 # Project-local scratch dir (switch-merge.sh sets TMPDIR here so mktemp
 # calls stay off system /tmp) - always cleaned up on exit, but ignore it
 # in case a run gets killed before its own trap fires.

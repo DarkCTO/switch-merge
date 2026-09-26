@@ -275,6 +275,13 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
   `openssl` (near-universal) is needed by `lib/nca_header.sh`. Neither is
   vendored (both are tiny/common enough not to bother), but the script
   checks for both explicitly at startup with a clear error if missing.
+- `bin/smtool` (the C port, see "Current state"/"Where to resume" above)
+  needs building once via `make -C src/smtool` before the default
+  (non-`--pure`) path works - `gcc`/`cc` and OpenSSL dev headers
+  (`libcrypto`) are needed at BUILD time only, confirmed present on this
+  machine already (OpenSSL 3.6.4, gcc 16.2.1). `switch-merge.sh` checks
+  for `bin/smtool`'s existence at startup with a clear error pointing at
+  the build command if missing, unless `--pure` is passed.
 - `~/.switch/prod.keys` — had a formatting bug on first use (some key
   entries had a stray trailing `00` byte); fixed in place, original backed
   up to `~/.switch/prod.keys.bak`. If `hacpack`/`hactool` throw "Failed to
@@ -289,6 +296,34 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
 
 1. Re-read `README.md` in full — it has the authoritative, kept-current
    pipeline description, known issues, and roadmap.
+0. **`smtool` (C port of the perf-critical pipeline) is IN PROGRESS, Phase
+   1 of 9 landed.** See README roadmap's `smtool` entry for full detail.
+   Short version: the bash pipeline is measured ~100x slower than the
+   vendored C tools on equivalent work, so a new `src/smtool/` C project
+   (links libcrypto) reimplements it as one-shot subcommands
+   (`bin/smtool <subcommand> ...`), called by default from
+   `switch-merge.sh`; `--pure` routes back to the original bash. Landed so
+   far: pure struct/container parsing only (cnmt/NACP/ticket/PFS0/HFS0
+   reading) — no crypto yet. Verified byte-for-byte against bash output on
+   every fixture in `tests/` (`bash tests/run.sh`) AND against a full real
+   1G1R merge (compiled vs `--pure`, `cmp`-identical output). **Honest
+   finding**: this phase's real-world speedup on a full merge is small —
+   the dominant real-file cost (copying a multi-GB secure partition to
+   scratch) is I/O-bound either way, not sped up by faster parsing. The
+   big wins are expected from later phases (NCA header/content crypto,
+   replacing hundreds of `openssl` subprocess spawns) — don't assume this
+   phase alone made the pipeline fast; it's phase 1 of 9, and the
+   remaining 8 are NOT done. Remaining phases, in order: NCA header
+   AES-XTS decrypt, NCA content-key derivation, RomFs/BKTR readers,
+   streaming AES-CTR content decryption, RomFs writer, NCA builder (Meta
+   then Program), final cutover (`smtool` becomes required, `--pure`
+   finalized as the explicit slow-path opt-in). If the user asks to
+   continue this, don't re-derive the design from scratch — the phase
+   ordering, subcommand-naming convention (`<noun>-<verb>`, `KEY=VALUE`
+   multi-field output), and `op_*`/`--pure` dispatch pattern are already
+   decided; follow the existing shape in `switch-merge.sh` (`op_parse_cnmt`
+   etc.) and `src/smtool/` (one `.c` file per module, `main.c` dispatches
+   by subcommand name) for the next phase rather than inventing a new one.
 2. **Vendored-tool elimination is done.** `nstool`/`hacpack`/`hactool` are
    all confirmed unused by the merge pipeline (see README roadmap's
    "fourth" through "eighth piece" entries for the full history: cnmt/NACP

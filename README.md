@@ -1294,6 +1294,104 @@ above.
       was built and checked), not because the pipeline needs them.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
+- [ ] **`smtool` (C port), Phase 1 of 9 — pure struct/container parsing,
+      implemented.** The bash pipeline, while dependency-free, was measured
+      to be roughly two orders of magnitude slower than the vendored C
+      tools doing equivalent work (extracting a real 2.6GB XCI: 74.6s vs
+      hactool's 0.77s) — dominated by per-byte hex-string parsing in bash
+      and hundreds of subprocess spawns (`dd`/`xxd`/`openssl`) per merge,
+      neither of which is tunable further (this project's `dd` calls
+      already seek directly via `skip=`/`iflag=skip_bytes`, no wasted I/O).
+      `src/smtool/` is a new C project (links `libcrypto`, same dependency
+      tier the vendored tools already carry) building `bin/smtool`, a
+      one-shot-subcommand tool in the same invocation style as
+      `nstool`/`hacpack`/`hactool` (`bin/smtool <subcommand> <args...>`,
+      spawn once, do one thing, exit). `switch-merge.sh` calls it by
+      default; a new `--pure` flag routes every call back through the
+      existing `lib/*.sh` bash functions instead, for whenever
+      zero-compiled-dependency matters more than speed. Every call site is
+      routed through a matching `op_*` bash wrapper (`op_parse_cnmt`,
+      `op_pfs0_extract_all`, etc.) so both paths stay in exactly one place
+      to keep in sync — never a per-call-site `if $PURE` branch scattered
+      through the pipeline.
+
+      This phase ports the read-only, no-crypto pieces: `lib/binfmt.sh`
+      (cnmt/NACP/ticket parsing — `cnmt-info`, `nacp-info`, `tik-info`),
+      the reader half of `lib/pfs0.sh` (`pfs0-list`, `pfs0-extract`,
+      `pfs0-extract-all`), and `lib/hfs0.sh` (`hfs0-data-off`, `hfs0-list`,
+      `hfs0-extract-all`). Every subcommand's multi-field output uses a
+      `KEY=VALUE`-per-line contract, named identically to the bash
+      globals it replaces (e.g. `CNMT_TITLE_ID=...`), read back via a new
+      shared `read_kv_into_vars` bash helper — deliberately NOT built via
+      `while read ... done < <(smtool ...)`, since a process substitution
+      isn't a pipeline and `$?`/`PIPESTATUS` after it don't reflect the
+      substituted command's real exit status (confirmed directly: a
+      subcommand returning 3 left the wrapper itself silently exiting 0)
+      — the same *shape* of subshell-exit-status gotcha `lib/bktr.sh`'s
+      own `_bktr_parse_bucket0_subsections` comment already documents
+      hitting and fixing the same way (capture via a plain command
+      substitution first, iterate over the captured text second).
+
+      Every data-copying subcommand (`pfs0-extract-all`, `hfs0-extract-all`)
+      streams with a fixed 1MB buffer via `fseeko`/`fread`/`fwrite` —
+      NEVER loads a whole container into memory — since this project's own
+      base-game NSPs and XCI secure partitions routinely run 1-15GB+; an
+      earlier version of this code naively `malloc`'d and read the entire
+      input file up front, which worked but wasted memory for no benefit
+      (this was caught and fixed before landing, while measuring that this
+      phase's actual speedup on real XCI classification was smaller than
+      hoped — see below).
+
+      **Honest finding on the speedup this phase actually delivers**:
+      profiling a real end-to-end merge (both a plain NSP and an XCI)
+      showed classification-step wall-clock time barely changes between
+      the compiled and `--pure` paths for a REAL file, because the
+      dominant cost there is disk I/O copying a multi-GB secure partition
+      to a scratch directory, not the small cnmt/NACP/PFS0/HFS0 field
+      parses this phase actually sped up — both the bash `dd`-based copy
+      and this phase's own C streaming copy are similarly I/O-bound. The
+      original 74.6s-vs-0.77s measurement that motivated this whole
+      effort compared this project's FULL pipeline (including crypto and
+      NCA-building, none of which this phase touches) against hactool's
+      own C implementation of the same full operation — not an
+      apples-to-apples measurement of this phase's actual, narrower
+      scope. The real, large wins are expected from later phases (NCA
+      header/content crypto, replacing hundreds of `openssl` subprocess
+      spawns with in-process AES) — this phase's value is establishing
+      the subcommand contract, the `op_*`/`--pure` dispatch pattern, and
+      the `tests/` fixture-harness pattern those later phases will reuse,
+      not raw speed on its own.
+
+      New `tests/` directory: `tests/fixtures/` holds small (bytes to
+      16KB) real and hand-constructed files — real cnmt/NACP/ticket/PFS0
+      data extracted from a real NSP this session, a real HFS0 header
+      region sliced out of a real XCI, and two deliberately-constructed
+      edge cases: a synthetic Patch/AddOnContent cnmt pair (no real update
+      NSP was available to source one from) built byte-by-byte from the
+      documented `PackagedContentMetaHeader`/`PackagedContentInfo` layout
+      — catching two real fixture-construction bugs along the way (a
+      missing 1-byte reserved field between `ContentMetaType` and
+      `ExtendedHeaderSize` that shifted every following field, and a
+      missing 0x20-byte hash prefix before each content entry's own
+      `ContentId`) by cross-checking against `lib/binfmt.sh`'s own parser
+      until both agreed — and a NACP whose AmericanEnglish (slot 0) name
+      is deliberately left empty with the real name only in slot 1,
+      exercising the exact already-hard-won fallback-scan bug
+      `lib/binfmt.sh`'s `parse_nacp` comment documents hitting for a real
+      title ("Talisman"). `tests/run.sh` runs both the bash function and
+      the matching `smtool` subcommand over every fixture and diffs the
+      output — no real `prod.keys` or large title files needed, since this
+      phase touches no crypto. Verified end-to-end, not just per-fixture:
+      a full real 1G1R merge (both a plain NSP and a two-title XCI) was
+      re-run once through the compiled path and once through `--pure`,
+      and the resulting output NSPs were confirmed byte-for-byte identical
+      (`cmp`) to each other.
+
+      **Not yet ported** (later phases, in order): NCA header AES-XTS
+      decrypt, NCA content-key derivation, RomFs/BKTR readers, streaming
+      AES-CTR content decryption, RomFs writer, NCA builder (Meta then
+      Program) — see this project's own planning notes for the full
+      phase-by-phase breakdown if picking this back up.
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0

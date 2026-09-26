@@ -90,12 +90,144 @@ source "$SCRIPT_DIR/lib/bktr.sh"
 source "$SCRIPT_DIR/lib/romfs_build.sh"
 source "$SCRIPT_DIR/lib/nca_build.sh"
 
+# PURE=1 (set via --pure) forces every op_* wrapper below to call the
+# bash lib/*.sh functions above directly, never bin/smtool - a slower,
+# zero-compiled-dependency fallback/novelty option for whenever that
+# property matters more than speed (see README's "smtool" section for
+# the measured ~100x speed difference this flag trades away). Default
+# is the compiled path - PURE=0 - since the whole point of smtool is to
+# make this project's normal, unflagged usage fast without giving up the
+# bash implementation entirely.
+PURE=0
+SMTOOL="$SCRIPT_DIR/bin/smtool"
+
+# read_kv_into_vars <command...>
+# Runs command, reading its stdout as "KEY=value" lines (one per line,
+# smtool's own multi-field output contract - see src/smtool/common.h)
+# and `declare -g`ing each KEY as a real global variable - matching
+# exactly how the equivalent lib/*.sh function already behaves today
+# (parse_cnmt/parse_nacp/parse_tik/nca_section_info etc. all set plain,
+# non-local globals for the caller to read immediately after the call,
+# never their own local scope), so callers see the identical variable
+# either way.
+#
+# Captures the command's output via a PLAIN command substitution first,
+# NOT `while read ... done < <(...)` - a process substitution is not a
+# pipeline, so $?/PIPESTATUS after the while loop reflects the loop/read
+# machinery, never the substituted command's own real exit status
+# (confirmed directly: a command returning 3 with this piped straight
+# into `done < <(...)` left the wrapper itself exiting 0). This is the
+# same *shape* of subshell-exit-status gotcha lib/bktr.sh's own
+# _bktr_parse_bucket0_subsections comment already documents hitting and
+# fixing the same way - capture first, iterate over the captured text
+# second, so a failure surfaces as a real, checkable nonzero return here
+# instead of silently looking like success.
+read_kv_into_vars() {
+    local output rc line key value
+    output="$("$@")"
+    rc=$?
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        declare -g "$key=$value"
+    done <<< "$output"
+    return "$rc"
+}
+
+# op_parse_cnmt <path.cnmt>
+# Sets the same CNMT_* globals parse_cnmt (lib/binfmt.sh) does, via
+# either that function directly (--pure) or `smtool cnmt-info` (default).
+op_parse_cnmt() {
+    if [ "$PURE" -eq 1 ]; then
+        parse_cnmt "$1"
+    else
+        read_kv_into_vars "$SMTOOL" cnmt-info "$1"
+    fi
+}
+
+# op_parse_nacp <control.nacp>
+# Sets NACP_NAME/NACP_DISPLAY_VERSION, same contract as parse_nacp.
+op_parse_nacp() {
+    if [ "$PURE" -eq 1 ]; then
+        parse_nacp "$1"
+    else
+        read_kv_into_vars "$SMTOOL" nacp-info "$1"
+    fi
+}
+
+# op_parse_tik <path.tik>
+# Sets TIK_TITLEKEY/TIK_RIGHTS_ID, same contract as parse_tik.
+op_parse_tik() {
+    if [ "$PURE" -eq 1 ]; then
+        parse_tik "$1"
+    else
+        read_kv_into_vars "$SMTOOL" tik-info "$1"
+    fi
+}
+
+# op_pfs0_read_entries <pfs0_file>
+# Prints "<name> <offset> <size>" lines, same contract as
+# _pfs0_read_entries.
+op_pfs0_read_entries() {
+    if [ "$PURE" -eq 1 ]; then
+        _pfs0_read_entries "$1"
+    else
+        "$SMTOOL" pfs0-list "$1"
+    fi
+}
+
+# op_pfs0_extract <pfs0_file> <entry_name> <out_path>
+op_pfs0_extract() {
+    if [ "$PURE" -eq 1 ]; then
+        pfs0_extract "$1" "$2" "$3"
+    else
+        "$SMTOOL" pfs0-extract "$1" "$2" "$3"
+    fi
+}
+
+# op_pfs0_extract_all <pfs0_file> <out_dir>
+op_pfs0_extract_all() {
+    if [ "$PURE" -eq 1 ]; then
+        pfs0_extract_all "$1" "$2"
+    else
+        "$SMTOOL" pfs0-extract-all "$1" "$2"
+    fi
+}
+
+# op_hfs0_data_off <hfs0_file> <header_offset>
+op_hfs0_data_off() {
+    if [ "$PURE" -eq 1 ]; then
+        _hfs0_data_off "$1" "$2"
+    else
+        "$SMTOOL" hfs0-data-off "$1" "$2"
+    fi
+}
+
+# op_hfs0_read_entries <hfs0_file> <header_offset>
+op_hfs0_read_entries() {
+    if [ "$PURE" -eq 1 ]; then
+        _hfs0_read_entries "$1" "$2"
+    else
+        "$SMTOOL" hfs0-list "$1" "$2"
+    fi
+}
+
+# op_hfs0_extract_all <hfs0_file> <header_offset> <out_dir>
+op_hfs0_extract_all() {
+    if [ "$PURE" -eq 1 ]; then
+        hfs0_extract_all "$1" "$2" "$3"
+    else
+        "$SMTOOL" hfs0-extract-all "$1" "$2" "$3"
+    fi
+}
+
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
 # NCA/tik/cert files - the pure-bash replacement for `nstool -x <out_dir>
 # <nsp_path>`. No decryption needed at this level.
 extract_nsp() {
-    pfs0_extract_all "$1" "$2"
+    op_pfs0_extract_all "$1" "$2"
 }
 
 # xci_split_to_nsps <xci_path> <work_dir> <out_var_name>
@@ -150,14 +282,17 @@ xci_split_to_nsps() {
 
     local root_dir="$work_dir/xci_root"
     mkdir -p "$root_dir"
+    local root_data_off
+    root_data_off="$(op_hfs0_data_off "$xci_path" "$root_off")" || return 1
+
     local secure_off="" name off size
     while read -r name off size; do
-        [ "$name" = "secure" ] && secure_off=$(( $(_hfs0_data_off "$xci_path" "$root_off") + off ))
-    done < <(_hfs0_read_entries "$xci_path" "$root_off")
+        [ "$name" = "secure" ] && secure_off=$(( root_data_off + off ))
+    done < <(op_hfs0_read_entries "$xci_path" "$root_off")
     [ -n "$secure_off" ] || { echo "xci_split_to_nsps: no 'secure' partition found in $xci_path" >&2; return 1; }
 
     local secure_dir="$work_dir/xci_secure"
-    hfs0_extract_all "$xci_path" "$secure_off" "$secure_dir" || return 1
+    op_hfs0_extract_all "$xci_path" "$secure_off" "$secure_dir" || return 1
 
     local -a synthetic_nsps=()
     local meta_nca title_tag=0
@@ -167,7 +302,7 @@ xci_split_to_nsps() {
 
         local cnmt_file="$work_dir/xci_${title_tag}.cnmt"
         extract_cnmt_from_meta_nca "$meta_nca" "$cnmt_file" || { echo "  Skipping $meta_nca (cnmt extraction failed)" >&2; continue; }
-        parse_cnmt "$cnmt_file"
+        op_parse_cnmt "$cnmt_file"
 
         local -a title_files=("$meta_nca")
         local content_id
@@ -216,11 +351,11 @@ extract_cnmt_from_meta_nca() {
     local name off size
     while read -r name off size; do
         if [[ "$name" == *.cnmt ]]; then
-            pfs0_extract "$pfs0_bin" "$name" "$out_path"
+            op_pfs0_extract "$pfs0_bin" "$name" "$out_path"
             rm -f "$pfs0_bin"
             return 0
         fi
-    done < <(_pfs0_read_entries "$pfs0_bin")
+    done < <(op_pfs0_read_entries "$pfs0_bin")
     rm -f "$pfs0_bin"
     echo "extract_cnmt_from_meta_nca: no .cnmt entry found in $meta_nca" >&2
     return 1
@@ -263,7 +398,7 @@ OUT_DIR="$SCRIPT_DIR/merged"
 INPUTS=()
 
 usage() {
-    echo "Usage: $0 [-o <output_dir>] [-k keys.dat] [<nsp-or-xci-or-dir> ...]" >&2
+    echo "Usage: $0 [-o <output_dir>] [-k keys.dat] [--pure] [<nsp-or-xci-or-dir> ...]" >&2
     exit 1
 }
 
@@ -271,10 +406,21 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -o) OUT_DIR="$2"; shift 2 ;;
         -k) KEYS="$2"; shift 2 ;;
+        --pure) PURE=1; shift ;;
         -*) usage ;;
         *) INPUTS+=("$1"); shift ;;
     esac
 done
+
+# --pure forces every op_* wrapper above to call the bash lib/*.sh
+# functions directly instead of bin/smtool. Without it, bin/smtool is
+# required to exist and be executable - fail loudly here rather than
+# let every op_* call site fail individually with a confusing "command
+# not found" deep inside the merge pipeline.
+if [ "$PURE" -eq 0 ] && [ ! -x "$SMTOOL" ]; then
+    echo "$SMTOOL not found or not executable - build it with 'make -C src/smtool', or pass --pure to use the slower pure-bash implementation instead" >&2
+    exit 1
+fi
 
 # With no positional inputs at all, default to scanning the directory this
 # script itself lives in - so `./switch-merge.sh` with no args just works
@@ -343,17 +489,17 @@ classify_nsp() {
     local name off size
     while read -r name off size; do
         [[ "$name" == *.cnmt.nca ]] && { meta_name="$name"; break; }
-    done < <(_pfs0_read_entries "$nsp")
+    done < <(op_pfs0_read_entries "$nsp")
     [ -n "$meta_name" ] || { echo "Could not find Meta NCA in $nsp" >&2; return 1; }
 
     meta_nca="$WORK/classify_${tag}_meta.nca"
-    pfs0_extract "$nsp" "$meta_name" "$meta_nca"
+    op_pfs0_extract "$nsp" "$meta_name" "$meta_nca"
 
     cnmt_file="$WORK/classify_${tag}.cnmt"
     extract_cnmt_from_meta_nca "$meta_nca" "$cnmt_file" || return 1
     [ -s "$cnmt_file" ] || { echo "Could not find .cnmt inside Meta NCA of $nsp" >&2; return 1; }
 
-    parse_cnmt "$cnmt_file"
+    op_parse_cnmt "$cnmt_file"
     [ -n "$CNMT_TYPE_NAME" ] || { echo "Could not determine content-meta type of $nsp" >&2; return 1; }
 
     if [ "$CNMT_TYPE_NAME" = "Application" ]; then
@@ -487,7 +633,7 @@ merge_group() {
     extract_cnmt_from_meta_nca "$META_NCA" "$CNMT_FILE" || exit 1
     [ -s "$CNMT_FILE" ] || { echo "[$title_id] Could not find .cnmt inside $PRIMARY_LABEL Meta NCA" >&2; exit 1; }
 
-    parse_cnmt "$CNMT_FILE"
+    op_parse_cnmt "$CNMT_FILE"
 
     local BASE_TITLE_ID
     if [ -n "$UPDATE_NSP" ]; then
@@ -529,7 +675,7 @@ merge_group() {
         BASE_CNMT_NCA="$(find "$BASE_DIR" -maxdepth 1 -name '*.cnmt.nca' | head -n1)"
         BASE_CNMT_FILE="$GROUP_WORK/base.cnmt"
         extract_cnmt_from_meta_nca "$BASE_CNMT_NCA" "$BASE_CNMT_FILE" || exit 1
-        parse_cnmt "$BASE_CNMT_FILE"
+        op_parse_cnmt "$BASE_CNMT_FILE"
         BASE_PROGRAM_NCA_ID="$CNMT_PROGRAM_ID"
         BASE_PROGRAM_SRC="$(find "$BASE_DIR" -maxdepth 1 -iname "${BASE_PROGRAM_NCA_ID}.nca" | head -n1)"
 
@@ -546,7 +692,7 @@ merge_group() {
             local tik
             tik="$(find "$dir" -maxdepth 1 -iname '*.tik' | head -n1)"
             [ -n "$tik" ] || { echo "[$title_id] No ticket found in $dir" >&2; exit 1; }
-            parse_tik "$tik"
+            op_parse_tik "$tik"
             echo "$TIK_TITLEKEY"
         }
         local BASE_TITLEKEY UPDATE_TITLEKEY
@@ -633,12 +779,12 @@ merge_group() {
         # prior verified reference outputs were all built via nstool -x
         # extraction, so matching that exact order is what byte-for-byte
         # continuity with those references actually requires).
-        pfs0_extract_all "$EXEFS_PFS0" "$RECON_EXEFS"
+        op_pfs0_extract_all "$EXEFS_PFS0" "$RECON_EXEFS"
         local EXEFS_FILES=()
         local exefs_name exefs_off exefs_size
         while read -r exefs_name exefs_off exefs_size; do
             EXEFS_FILES=("$RECON_EXEFS/$exefs_name" "${EXEFS_FILES[@]}")
-        done < <(_pfs0_read_entries "$EXEFS_PFS0")
+        done < <(op_pfs0_read_entries "$EXEFS_PFS0")
         rm -f "$EXEFS_PFS0"
 
         echo "==> [$title_id] Rebuilding standalone (non-titlekey) Program NCA from reconstructed content"
@@ -743,7 +889,7 @@ merge_group() {
 
         local GAME_NAME="" DISPLAY_VERSION=""
         if [ -n "$NACP_FILE" ] && [ -s "$NACP_FILE" ]; then
-            parse_nacp "$NACP_FILE"
+            op_parse_nacp "$NACP_FILE"
             GAME_NAME="$NACP_NAME"
             DISPLAY_VERSION="$NACP_DISPLAY_VERSION"
         fi
