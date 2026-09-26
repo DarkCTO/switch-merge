@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L
 LDLIBS := -lcrypto
 
-SRCS := main.c common.c cnmt.c nacp.c tik.c pfs0.c hfs0.c
+SRCS := main.c common.c crypto.c cnmt.c nacp.c tik.c pfs0.c hfs0.c nca_header.c
 OBJS := $(SRCS:.c=.o)
 BIN := ../../bin/smtool
 

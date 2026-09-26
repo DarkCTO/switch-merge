@@ -21,6 +21,8 @@ int cmd_pfs0_extract_all(int argc, char **argv);
 int cmd_hfs0_data_off(int argc, char **argv);
 int cmd_hfs0_list(int argc, char **argv);
 int cmd_hfs0_extract_all(int argc, char **argv);
+int cmd_nca_header_decrypt(int argc, char **argv);
+int cmd_nca_rights_id(int argc, char **argv);
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -35,7 +37,9 @@ int main(int argc, char **argv) {
             "  pfs0-extract-all <path> <out_dir>\n"
             "  hfs0-data-off <path> <header_offset>\n"
             "  hfs0-list <path> <header_offset>\n"
-            "  hfs0-extract-all <path> <header_offset> <out_dir>\n");
+            "  hfs0-extract-all <path> <header_offset> <out_dir>\n"
+            "  nca-header-decrypt <nca_path> --keys <keys_file> -o <out_file>\n"
+            "  nca-rights-id <nca_path> --keys <keys_file>\n");
         return 1;
     }
 
@@ -52,6 +56,8 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "hfs0-data-off") == 0) return cmd_hfs0_data_off(sargc, sargv);
     if (strcmp(sub, "hfs0-list") == 0) return cmd_hfs0_list(sargc, sargv);
     if (strcmp(sub, "hfs0-extract-all") == 0) return cmd_hfs0_extract_all(sargc, sargv);
+    if (strcmp(sub, "nca-header-decrypt") == 0) return cmd_nca_header_decrypt(sargc, sargv);
+    if (strcmp(sub, "nca-rights-id") == 0) return cmd_nca_rights_id(sargc, sargv);
 
     fprintf(stderr, "smtool: unknown subcommand '%s'\n", sub);
     return 1;

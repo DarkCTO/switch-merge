@@ -16,6 +16,7 @@ SMTOOL="$SCRIPT_DIR/bin/smtool"
 source "$SCRIPT_DIR/lib/binfmt.sh"
 source "$SCRIPT_DIR/lib/pfs0.sh"
 source "$SCRIPT_DIR/lib/hfs0.sh"
+source "$SCRIPT_DIR/lib/nca_header.sh"
 
 [ -x "$SMTOOL" ] || { echo "FAIL: $SMTOOL not found or not executable - build it first with 'make -C src/smtool'" >&2; exit 1; }
 
@@ -99,6 +100,36 @@ if [ -f "$f" ]; then
     assert_kv_match "hfs0-list" "$bash_out" "$smtool_out"
 else
     echo "SKIP: xci_root.hfs0 fixture missing"
+fi
+
+# --- nca-rights-id / nca-header-decrypt: both fixtures below already
+# exercise the big-endian-vs-little-endian sector-tweak distinction that
+# matters most here - RightsId lives at header offset 0x230, inside
+# SECTOR 1 (0x200-0x3FF), and sector 1's tweak-seed encodes differently
+# as big-endian (00...01) vs little-endian (01...00), unlike sector 0
+# (all-zero either way, so testing only sector 0 couldn't catch a
+# wrong-endianness regression at all). No separate synthetic-tweak
+# fixture needed - a wrong endianness here would already produce a
+# wrong (garbage, not just differently-formatted) RightsId in the tests
+# below.
+#
+# Needs a real prod.keys, which
+# can't be committed (console-specific, gitignored) - skip automatically
+# if one isn't present rather than fail the whole suite. This is the
+# "manual-only verification" case tests/run.sh's own design accepted:
+# CI/a clean checkout with no keys still gets full coverage of every
+# fixture that doesn't need one.
+REAL_KEYS="$HOME/.switch/prod.keys"
+if [ -f "$REAL_KEYS" ]; then
+    for shape in program_titlekey control_standard; do
+        f="$FIXTURES/$shape.nca_header"
+        [ -f "$f" ] || { echo "SKIP: $shape.nca_header fixture missing"; continue; }
+        bash_out="$(nca_rights_id "$f" "$REAL_KEYS")"
+        smtool_out="$("$SMTOOL" nca-rights-id "$f" --keys "$REAL_KEYS")"
+        assert_kv_match "nca-rights-id ($shape)" "RIGHTS_ID=$bash_out" "RIGHTS_ID=$smtool_out"
+    done
+else
+    echo "SKIP: nca-rights-id tests (no $REAL_KEYS on this machine)"
 fi
 
 echo

@@ -1387,11 +1387,52 @@ above.
       and the resulting output NSPs were confirmed byte-for-byte identical
       (`cmp`) to each other.
 
-      **Not yet ported** (later phases, in order): NCA header AES-XTS
-      decrypt, NCA content-key derivation, RomFs/BKTR readers, streaming
-      AES-CTR content decryption, RomFs writer, NCA builder (Meta then
-      Program) — see this project's own planning notes for the full
-      phase-by-phase breakdown if picking this back up.
+      **Not yet ported** (later phases, in order): NCA content-key
+      derivation, RomFs/BKTR readers, streaming AES-CTR content
+      decryption, RomFs writer, NCA builder (Meta then Program) — see
+      this project's own planning notes for the full phase-by-phase
+      breakdown if picking this back up.
+- [ ] **`smtool` (C port), Phase 2 of 9 — NCA header AES-XTS decrypt,
+      implemented.** New `src/smtool/crypto.c`/`.h` wraps libcrypto's EVP
+      API for raw AES-128-ECB (single/multi-block, no padding) — the one
+      block-cipher primitive AES-XTS/key-unwrap/AES-CTR are all built
+      from, same layering `lib/nca_header.sh`'s `aes_ecb_hex` uses (just
+      calling libcrypto in-process instead of shelling out to the
+      `openssl` CLI). New `src/smtool/nca_header.c` ports the AES-XTS
+      header decryption itself — Nintendo's non-standard big-endian
+      per-sector tweak seed and the standard GF(2^128) tweak-doubling
+      between blocks within a sector — plus two subcommands:
+      `nca-header-decrypt <nca> --keys <keys> -o <out>` (decrypts the
+      full 0xC00-byte header to a file — unlike the bash version's
+      per-field `nca_header_field`, this decrypts everything ONCE per
+      NCA; later phases needing more header fields read the decrypted
+      buffer directly in C rather than spawning another subcommand per
+      field) and `nca-rights-id <nca> --keys <keys>` (the one field read
+      directly by name in `switch-merge.sh` itself this phase, via a new
+      `op_nca_rights_id` wrapper covering all three of its call sites).
+
+      Verified against real files at every level: `nca-header-decrypt`'s
+      output matches `lib/nca_header.sh`'s own per-field decrypt
+      byte-for-byte on a real titlekey-crypto Program NCA (including
+      confirming the "NCA3" magic lands at the documented offset 0x200 —
+      i.e. sector 1, not sector 0 — inside the decrypted output);
+      `nca-rights-id` matches both the bash function AND `nstool -t nca
+      -v`'s own "RightsId:" dump exactly on that same file, and correctly
+      returns empty on a real standard-crypto Control NCA (confirmed
+      `nstool` shows no RightsId line at all for that file, i.e. it's
+      genuinely absent, not zero-and-hidden). A full real 1G1R merge
+      (titlekey-crypto NSP, standard-crypto XCI) was re-run through both
+      the compiled and `--pure` paths and produced byte-for-byte
+      identical (`cmp`) output either way. `tests/run.sh` gained
+      `nca-rights-id` fixture tests using just the 3072-byte encrypted
+      header region of two real NCAs (titlekey-crypto and standard-crypto)
+      — these specifically exercise RightsId at header offset 0x230,
+      inside SECTOR 1, where the big-endian-vs-little-endian tweak
+      distinction actually matters (sector 0's tweak seed is all-zero
+      either way, so a sector-0-only test couldn't have caught a wrong-
+      endianness regression at all) — skipped automatically if no real
+      `~/.switch/prod.keys` is present on the machine running the tests
+      (can't be committed, console-specific).
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0

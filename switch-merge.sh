@@ -222,6 +222,21 @@ op_hfs0_extract_all() {
     fi
 }
 
+# op_nca_rights_id <nca_path>
+# Echoes the NCA's RightsId, or empty for standard crypto - same
+# contract as nca_rights_id (lib/nca_header.sh). Uses $KEYS directly
+# (set by CLI arg parsing further down) rather than taking it as a
+# parameter, matching how nca_rights_id itself is already called
+# everywhere in this file (always with "$KEYS", never a different key
+# file per call site).
+op_nca_rights_id() {
+    if [ "$PURE" -eq 1 ]; then
+        nca_rights_id "$1" "$KEYS"
+    else
+        "$SMTOOL" nca-rights-id "$1" --keys "$KEYS"
+    fi
+}
+
 # extract_nsp <nsp_path> <out_dir>
 # Splits an NSP (a plain, unencrypted PFS0 container) into its component
 # NCA/tik/cert files - the pure-bash replacement for `nstool -x <out_dir>
@@ -334,7 +349,7 @@ xci_split_to_nsps() {
 extract_cnmt_from_meta_nca() {
     local meta_nca="$1" out_path="$2"
     local rights_id
-    rights_id="$(nca_rights_id "$meta_nca" "$KEYS")"
+    rights_id="$(op_nca_rights_id "$meta_nca")"
     [ -z "$rights_id" ] || { echo "extract_cnmt_from_meta_nca: $meta_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Meta NCA like this has been seen before" >&2; return 1; }
 
     nca_section_info "$meta_nca" "$KEYS" 0
@@ -373,7 +388,7 @@ extract_cnmt_from_meta_nca() {
 extract_nacp_from_control_nca() {
     local control_nca="$1" out_path="$2"
     local rights_id
-    rights_id="$(nca_rights_id "$control_nca" "$KEYS")"
+    rights_id="$(op_nca_rights_id "$control_nca")"
     [ -z "$rights_id" ] || { echo "extract_nacp_from_control_nca: $control_nca is titlekey-crypto (RightsId $rights_id) - unsupported, no Control NCA like this has been seen before" >&2; return 1; }
 
     nca_section_info "$control_nca" "$KEYS" 0
@@ -662,7 +677,7 @@ merge_group() {
     # application - see README for the full story.
     local PRIMARY_PROGRAM_SRC PROGRAM_RIGHTS_ID PROGRAM_PATH
     PRIMARY_PROGRAM_SRC="$(find "$PRIMARY_DIR" -maxdepth 1 -iname "${PROGRAM_NCA}.nca" | head -n1)"
-    PROGRAM_RIGHTS_ID="$(nca_rights_id "$PRIMARY_PROGRAM_SRC" "$KEYS")"
+    PROGRAM_RIGHTS_ID="$(op_nca_rights_id "$PRIMARY_PROGRAM_SRC")"
 
     if [ -n "$PROGRAM_RIGHTS_ID" ] && [ -n "$UPDATE_NSP" ]; then
         echo "==> [$title_id] Update Program NCA is titlekey-crypto (RightsId $PROGRAM_RIGHTS_ID) - reconstructing full romfs/exefs against base"
