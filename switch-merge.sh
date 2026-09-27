@@ -408,6 +408,23 @@ extract_nsp() {
     op_pfs0_extract_all "$1" "$2"
 }
 
+# is_name_garbled <name>
+# True (0) if a NACP-derived game name is empty, OR not valid UTF-8 -
+# both cases mean the dump's own NACP name table is corrupted/truncated,
+# not that this project's own NACP parser did anything wrong (confirmed
+# against a real dump whose name field decoded to a single stray
+# non-UTF-8 byte, byte-for-byte identical to nstool's own extraction of
+# the same NCA - the corruption is in the file, not the read). Checked
+# via `iconv -f utf-8 -t utf-8`, which correctly distinguishes real
+# corruption from a legitimate accented/CJK name - a printable-ASCII-only
+# check would wrongly flag every non-English game name as "garbled" too.
+is_name_garbled() {
+    local name="$1"
+    [ -z "$name" ] && return 0
+    printf '%s' "$name" | iconv -f utf-8 -t utf-8 >/dev/null 2>&1
+    [ $? -ne 0 ]
+}
+
 # xci_split_to_nsps <xci_path> <work_dir> <out_var_name>
 # Splits an XCI (gamecard dump) into one synthetic .nsp per title found in
 # its "secure" HFS0 partition, writing paths to the array named by
@@ -1070,6 +1087,25 @@ merge_group() {
             op_parse_nacp "$NACP_FILE"
             GAME_NAME="$NACP_NAME"
             DISPLAY_VERSION="$NACP_DISPLAY_VERSION"
+        fi
+
+        # A dump's NACP name table can itself be corrupted/truncated (not
+        # a parsing bug on this project's side - confirmed against a real
+        # file whose name field decoded to a single non-UTF-8 byte in
+        # every case checked, byte-for-byte identical to nstool's own
+        # extraction of the same NCA) - detect via is_name_garbled (empty,
+        # OR not valid UTF-8, checked with iconv rather than a printable-
+        # ASCII-only check so real accented/CJK names aren't
+        # false-positived as "garbled") and offer to type the real name
+        # in by hand, ONLY when stdin is a real terminal - a
+        # non-interactive run (script/cron/CI) falls back to today's
+        # existing behavior (bare title-ID filename) instead of hanging
+        # forever waiting for input that will never come.
+        if is_name_garbled "$GAME_NAME" && [ -t 0 ]; then
+            echo "[$title_id] This NSP's NACP name looks corrupted or empty (got: '${GAME_NAME}')." >&2
+            local TYPED_NAME
+            read -r -p "  Enter the correct game name, or leave blank to skip: " TYPED_NAME
+            [ -n "$TYPED_NAME" ] && GAME_NAME="$TYPED_NAME"
         fi
 
         if [ -n "$GAME_NAME" ] && [ -n "$DISPLAY_VERSION" ]; then

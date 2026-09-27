@@ -155,6 +155,24 @@ count>` is always shown, including `[0]` when none were given. Installable
 directly (e.g. via Tinfoil/DBI) with no separate update or DLC install step
 needed.
 
+Some real dumps have a corrupted/truncated NACP name table (confirmed on a
+real title whose name field decoded to a single stray non-UTF-8 byte in
+every language slot — genuine dump corruption, not a switch-merge bug). If
+`<Name>` looks empty or fails UTF-8 validation, and the script is running
+in a real terminal, it will interactively prompt for the correct name
+(e.g. because your emulator resolved it via an online title-ID database and
+you already know it) rather than baking the garbled bytes into the output
+filename:
+
+```
+[0100304027592000] This NSP's NACP name looks corrupted or empty (got: '<20>').
+  Enter the correct game name, or leave blank to skip:
+```
+
+Leave it blank to keep the old behavior. Non-interactive runs (scripts,
+cron, CI — anything where stdin isn't a tty) always skip the prompt and
+fall back to it automatically, so this never hangs an automated run.
+
 ## Switch content format, from scratch
 
 Skip this section if you already know what an NCA, cnmt, RightsId, or BKTR
@@ -902,6 +920,14 @@ above.
   bash variable and printed with `printf '%s'`. Fixed by streaming each
   filename directly to the output with its own `printf '%s\0'` call
   instead (`lib/pfs0.sh`).
+- **A real dump's own Control NCA NACP name table can be corrupted** —
+  confirmed on a real title (Urban Jungle, `0100304027592000`) whose name
+  field decoded to a single stray non-UTF-8 byte in every language slot,
+  byte-for-byte identical to `nstool`'s own extraction of the same NCA —
+  genuine dump corruption, not a parsing bug here. See "Usage" above:
+  `switch-merge.sh` now detects this (empty name, or fails UTF-8
+  validation via `iconv`) and, only in a real terminal, prompts for the
+  correct name instead of baking garbled bytes into the output filename.
 
 ## Tools considered and ruled out
 

@@ -174,6 +174,25 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
   `lib/binfmt.sh`'s `parse_nacp` — not the cnmt's internal version integer,
   which is a meaningless build number, not the player-facing `1.2.12`-style
   string.
+- **A dump's own NACP name table can be corrupted/truncated** — confirmed
+  on a real title (Urban Jungle, `0100304027592000`) whose Control NCA's
+  name field decoded to a single stray non-UTF-8 byte in every language
+  slot, byte-for-byte identical to `nstool`'s own extraction of the same
+  NCA (i.e. genuine dump corruption, not a parsing bug on this project's
+  side — the emulator that still shows the correct name for this title
+  does so via an external title-ID database lookup, not by reading the
+  file). `switch-merge.sh`'s `is_name_garbled()` (right before
+  `extract_nsp()`) detects this — empty name, OR fails `iconv -f utf-8 -t
+  utf-8` validity — and, only when stdin is a real terminal (`[ -t 0 ]`),
+  interactively prompts for the correct name instead of baking the garbled
+  bytes into the output filename. Deliberately UTF-8-validity-checked
+  rather than printable-ASCII-only, so legitimate accented/CJK game names
+  are never false-positived as "garbled." Non-interactive runs (scripts/
+  cron/CI, stdin not a tty) skip the prompt and keep the prior fallback
+  behavior unchanged (bare title-ID-only filename). Verified against the
+  real Urban Jungle NSP both ways: a real pty with typed input produces
+  `Urban Jungle [0100304027592000][0.0.29][0].nsp`; stdin from `/dev/null`
+  falls back cleanly with no hang.
 - **`lib/binfmt.sh` byte layouts are hand-verified, not just copied from
   switchbrew.org** — every field offset was cross-checked by parsing this
   project's own real extracted `.cnmt`/`.nacp` files and comparing against
