@@ -19,10 +19,12 @@
  * the ACTUAL stride is a fixed 0x4000 bytes, no overflow room at all).
  */
 #include "common.h"
+#include "nca_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static uint32_t le_u32_at(const unsigned char *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -234,4 +236,304 @@ int cmd_bktr_headers(int argc, char **argv) {
     print_kv_u64("BKTR_SUBSEC_OFF", subsec_off);
     print_kv_u64("BKTR_SUBSEC_SIZE", subsec_size);
     return 0;
+}
+
+/* --- In-process BKTR reconstruction (bktr_reconstruct) ---
+ *
+ * Reconstructs the FULL virtual romfs by walking the relocation table:
+ * each relocation entry's byte range is copied either from the update
+ * NCA's own physical romfs bytes (decrypted per-subsection, is_patch)
+ * or straight from the base's already-decrypted romfs at the SAME
+ * relocation-relative offset (not is_patch). A patch-type relocation
+ * entry's physical byte range can itself span multiple subsections
+ * (each with its own AES-CTR ctr_val), so each entry is further split
+ * at every subsection boundary it crosses before decrypting - exact
+ * port of lib/bktr.sh's own bktr_reconstruct, reusing this file's
+ * already-verified table-parsing logic and nca_content.c's key/CTR
+ * primitives in-process instead of driving them via subprocess calls. */
+
+typedef struct { uint64_t virt, phys; uint32_t is_patch; } reloc_entry_t;
+typedef struct { uint64_t off; uint32_t ctr_val; } subsec_entry_t;
+
+/* read_relocation_table_mem <table_file> <**out_entries> <*out_count> <*out_total_size>
+ * Same walk as cmd_bktr_relocations, but into an in-memory array plus a
+ * trailing total_size value, instead of printing lines. */
+static int read_relocation_table_mem(const char *table_path, reloc_entry_t **out_entries, size_t *out_count, uint64_t *out_total_size) {
+    FILE *f = fopen(table_path, "rb");
+    if (!f) { fprintf(stderr, "could not open %s\n", table_path); return 1; }
+    unsigned char hdr[16];
+    if (fread(hdr, 1, 16, f) != 16) { fprintf(stderr, "could not read BKTR relocation block header\n"); fclose(f); return 1; }
+    uint32_t num_buckets = le_u32_at(hdr + 4);
+    uint64_t total_size = le_u64_at(hdr + 8);
+
+    const uint64_t bucket_stride = 0x4000;
+    const uint64_t all_buckets_off = 0x10 + 0x3FF0;
+    uint64_t all_buckets_size = (uint64_t)num_buckets * bucket_stride;
+    unsigned char *buckets = malloc(all_buckets_size > 0 ? all_buckets_size : 1);
+    if (all_buckets_size > 0) {
+        if (fseeko(f, (off_t)all_buckets_off, SEEK_SET) != 0 || fread(buckets, 1, all_buckets_size, f) != all_buckets_size) {
+            fprintf(stderr, "could not read relocation buckets\n");
+            free(buckets);
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+
+    size_t cap = 1024, count = 0;
+    reloc_entry_t *entries = malloc(cap * sizeof(reloc_entry_t));
+    for (uint32_t b = 0; b < num_buckets; b++) {
+        const unsigned char *bucket = buckets + (uint64_t)b * bucket_stride;
+        uint32_t num_entries = le_u32_at(bucket + 4);
+        for (uint32_t i = 0; i < num_entries; i++) {
+            if (count == cap) { cap *= 2; entries = realloc(entries, cap * sizeof(reloc_entry_t)); }
+            const unsigned char *entry = bucket + 0x10 + (uint64_t)i * 0x14;
+            entries[count].virt = le_u64_at(entry);
+            entries[count].phys = le_u64_at(entry + 8);
+            entries[count].is_patch = le_u32_at(entry + 16);
+            count++;
+        }
+    }
+    free(buckets);
+    *out_entries = entries;
+    *out_count = count;
+    *out_total_size = total_size;
+    return 0;
+}
+
+/* read_subsection_table_mem - same idea for the subsection table, plus
+ * the LAST bucket's own physical_offset_end as a trailing sentinel
+ * value (appended as one more entry with ctr_val unused, matching
+ * lib/bktr.sh's own "num_subsec = count - 1" convention exactly). */
+static int read_subsection_table_mem(const char *table_path, subsec_entry_t **out_entries, size_t *out_count) {
+    FILE *f = fopen(table_path, "rb");
+    if (!f) { fprintf(stderr, "could not open %s\n", table_path); return 1; }
+    unsigned char hdr[16];
+    if (fread(hdr, 1, 16, f) != 16) { fprintf(stderr, "could not read BKTR subsection block header\n"); fclose(f); return 1; }
+    uint32_t num_buckets = le_u32_at(hdr + 4);
+
+    const uint64_t bucket_stride = 0x4000;
+    const uint64_t all_buckets_off = 0x10 + 0x3FF0;
+    uint64_t all_buckets_size = (uint64_t)num_buckets * bucket_stride;
+    unsigned char *buckets = malloc(all_buckets_size > 0 ? all_buckets_size : 1);
+    if (all_buckets_size > 0) {
+        if (fseeko(f, (off_t)all_buckets_off, SEEK_SET) != 0 || fread(buckets, 1, all_buckets_size, f) != all_buckets_size) {
+            fprintf(stderr, "could not read subsection buckets\n");
+            free(buckets);
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+
+    size_t cap = 1024, count = 0;
+    subsec_entry_t *entries = malloc(cap * sizeof(subsec_entry_t));
+    uint64_t last_physical_offset_end = 0;
+    for (uint32_t b = 0; b < num_buckets; b++) {
+        const unsigned char *bucket = buckets + (uint64_t)b * bucket_stride;
+        uint32_t num_entries = le_u32_at(bucket + 4);
+        last_physical_offset_end = le_u64_at(bucket + 8);
+        for (uint32_t i = 0; i < num_entries; i++) {
+            if (count == cap) { cap *= 2; entries = realloc(entries, cap * sizeof(subsec_entry_t)); }
+            const unsigned char *entry = bucket + 0x10 + (uint64_t)i * 0x10;
+            entries[count].off = le_u64_at(entry);
+            entries[count].ctr_val = le_u32_at(entry + 12);
+            count++;
+        }
+    }
+    free(buckets);
+
+    if (count == cap) { cap += 1; entries = realloc(entries, cap * sizeof(subsec_entry_t)); }
+    entries[count].off = last_physical_offset_end;
+    entries[count].ctr_val = 0;
+    count++;
+
+    *out_entries = entries;
+    *out_count = count;
+    return 0;
+}
+
+/* cmd_bktr_reconstruct <update_nca> --keys <keys> --key-hex <hex32>
+ *   --section <0-3> --base-romfs <path> -o <out_path>
+ * update_nca/--section identify the update's own Program NCA and which
+ * of its sections is the BKTR-delta romfs; --key-hex is the update's
+ * own already-derived AES-CTR content key (from nca-content-key-
+ * titlekey, same as every other content-key consumer in this project);
+ * --base-romfs is the base Program NCA's own romfs SECTION already
+ * decrypted to plaintext (e.g. via decrypt-section on the base's own
+ * romfs section - NOT the whole NCA file). */
+int cmd_bktr_reconstruct(int argc, char **argv) {
+    const char *update_nca = NULL, *keys_path = NULL, *key_hex = NULL, *section_str = NULL, *base_romfs = NULL, *out_path = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--keys") == 0 && i + 1 < argc) { keys_path = argv[++i]; }
+        else if (strcmp(argv[i], "--key-hex") == 0 && i + 1 < argc) { key_hex = argv[++i]; }
+        else if (strcmp(argv[i], "--section") == 0 && i + 1 < argc) { section_str = argv[++i]; }
+        else if (strcmp(argv[i], "--base-romfs") == 0 && i + 1 < argc) { base_romfs = argv[++i]; }
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { out_path = argv[++i]; }
+        else if (!update_nca) { update_nca = argv[i]; }
+    }
+    if (!update_nca || !keys_path || !key_hex || !section_str || !base_romfs || !out_path) {
+        fprintf(stderr, "usage: smtool bktr-reconstruct <update_nca> --keys <keys_file> --key-hex <hex32> --section <0-3> --base-romfs <path> -o <out_path>\n");
+        return 1;
+    }
+    char *end;
+    long section_num = strtol(section_str, &end, 10);
+    if (*end != '\0' || section_num < 0 || section_num > 3) {
+        fprintf(stderr, "bktr-reconstruct: invalid --section '%s'\n", section_str);
+        return 1;
+    }
+    size_t key_len;
+    unsigned char *key = hex_decode(key_hex, &key_len);
+    if (!key || key_len != 16) {
+        fprintf(stderr, "bktr-reconstruct: --key-hex must be 32 hex chars\n");
+        free(key);
+        return 1;
+    }
+
+    unsigned char header[NCA_HEADER_SIZE];
+    if (nca_decrypt_header(update_nca, keys_path, header) != 0) { free(key); return 1; }
+
+    size_t fs_hdr_off = 0x400 + (size_t)section_num * 0x200;
+    size_t reloc_hdr_off = fs_hdr_off + 0x100;
+    size_t subsec_hdr_off = fs_hdr_off + 0x120;
+    if (memcmp(header + reloc_hdr_off + 16, "BKTR", 4) != 0 || memcmp(header + subsec_hdr_off + 16, "BKTR", 4) != 0) {
+        fprintf(stderr, "bktr-reconstruct: BKTR magic not found at expected offset\n");
+        free(key);
+        return 1;
+    }
+    uint64_t reloc_off = le_u64_at(header + reloc_hdr_off);
+    uint64_t reloc_size = le_u64_at(header + reloc_hdr_off + 8);
+    uint64_t subsec_off = le_u64_at(header + subsec_hdr_off);
+    uint64_t subsec_size = le_u64_at(header + subsec_hdr_off + 8);
+
+    nca_section_info_t section_info;
+    nca_section_info(header, (int)section_num, &section_info);
+    if (!section_info.present) {
+        fprintf(stderr, "bktr-reconstruct: section %ld not present in %s\n", section_num, update_nca);
+        free(key);
+        return 1;
+    }
+    uint64_t section_offset = section_info.offset;
+
+    const unsigned char *section_ctr_raw = header + fs_hdr_off + 0x140;
+
+    char reloc_table_path[600], subsec_table_path[600];
+    make_scratch_template("smtool_bktr_reloc_", reloc_table_path, sizeof(reloc_table_path));
+    make_scratch_template("smtool_bktr_subsec_", subsec_table_path, sizeof(subsec_table_path));
+    int fd1 = mkstemp(reloc_table_path);
+    int fd2 = mkstemp(subsec_table_path);
+    if (fd1 < 0 || fd2 < 0) { fprintf(stderr, "bktr-reconstruct: mkstemp failed\n"); free(key); return 1; }
+    close(fd1);
+    close(fd2);
+
+    unsigned char reloc_ctr[16], subsec_ctr[16];
+    nca_content_ctr(section_ctr_raw, section_offset + reloc_off, reloc_ctr);
+    nca_content_ctr(section_ctr_raw, section_offset + subsec_off, subsec_ctr);
+
+    if (nca_ctr_decrypt_range(update_nca, key, reloc_ctr, section_offset + reloc_off, reloc_size, reloc_table_path) != 0 ||
+        nca_ctr_decrypt_range(update_nca, key, subsec_ctr, section_offset + subsec_off, subsec_size, subsec_table_path) != 0) {
+        fprintf(stderr, "bktr-reconstruct: failed to read relocation/subsection tables\n");
+        remove(reloc_table_path);
+        remove(subsec_table_path);
+        free(key);
+        return 1;
+    }
+
+    reloc_entry_t *reloc_entries; size_t reloc_count; uint64_t total_size;
+    subsec_entry_t *subsec_entries; size_t subsec_count;
+    int rc = read_relocation_table_mem(reloc_table_path, &reloc_entries, &reloc_count, &total_size);
+    rc = rc || read_subsection_table_mem(subsec_table_path, &subsec_entries, &subsec_count);
+    remove(reloc_table_path);
+    remove(subsec_table_path);
+    if (rc != 0) { free(key); return 1; }
+
+    /* Add the synthetic trailing total_size entry to the relocation
+     * array too, mirroring _bktr_parse_bucket0_relocations' own final
+     * line - simplifies the chunk-boundary walk below (every REAL entry
+     * has a "next" entry to compute chunk_len against, including the
+     * last one). */
+    reloc_entry_t *reloc_all = malloc((reloc_count + 1) * sizeof(reloc_entry_t));
+    memcpy(reloc_all, reloc_entries, reloc_count * sizeof(reloc_entry_t));
+    reloc_all[reloc_count].virt = total_size;
+    reloc_all[reloc_count].phys = 0;
+    reloc_all[reloc_count].is_patch = 0;
+    free(reloc_entries);
+    size_t reloc_total = reloc_count + 1;
+    size_t num_subsec = subsec_count - 1; /* last entry is the trailing sentinel */
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) { fprintf(stderr, "bktr-reconstruct: could not open %s\n", out_path); free(reloc_all); free(subsec_entries); free(key); return 1; }
+    fclose(out); /* truncate/create - subsequent writes append */
+
+    FILE *base_f = fopen(base_romfs, "rb");
+    if (!base_f) { fprintf(stderr, "bktr-reconstruct: could not open %s\n", base_romfs); free(reloc_all); free(subsec_entries); free(key); return 1; }
+
+    int had_prev = 0;
+    uint64_t prev_virt = 0, prev_phys = 0;
+    uint32_t prev_is_patch = 0;
+    int final_rc = 0;
+
+    for (size_t idx = 0; idx < reloc_total && final_rc == 0; idx++) {
+        uint64_t virt = reloc_all[idx].virt;
+        uint64_t phys = reloc_all[idx].phys;
+        uint32_t is_patch = reloc_all[idx].is_patch;
+
+        if (had_prev) {
+            uint64_t chunk_len = virt - prev_virt;
+            if (prev_is_patch) {
+                uint64_t chunk_start = prev_phys, chunk_end = prev_phys + chunk_len;
+                uint64_t cur = chunk_start;
+                while (cur < chunk_end) {
+                    size_t si = 0;
+                    while (si + 1 <= num_subsec && subsec_entries[si + 1].off <= cur) si++;
+                    uint64_t subsec_end = subsec_entries[si + 1].off;
+                    uint64_t read_end = chunk_end;
+                    if (subsec_end < read_end) read_end = subsec_end;
+                    uint64_t read_len = read_end - cur;
+
+                    uint64_t phys_abs = section_offset + cur;
+                    unsigned char chunk_ctr[16];
+                    nca_content_ctr(section_ctr_raw, phys_abs, chunk_ctr);
+                    /* ctr_val overwrites bytes 4-7 of the CTR (matches
+                     * lib/bktr.sh's own "${ctr:0:8}${ctr_val_hex}${ctr:16:16}"
+                     * text-splice exactly - big-endian 4-byte value at
+                     * that position). */
+                    uint32_t ctr_val = subsec_entries[si].ctr_val;
+                    chunk_ctr[4] = (unsigned char)((ctr_val >> 24) & 0xFF);
+                    chunk_ctr[5] = (unsigned char)((ctr_val >> 16) & 0xFF);
+                    chunk_ctr[6] = (unsigned char)((ctr_val >> 8) & 0xFF);
+                    chunk_ctr[7] = (unsigned char)(ctr_val & 0xFF);
+
+                    if (nca_ctr_decrypt_range_append(update_nca, key, chunk_ctr, phys_abs, read_len, out_path) != 0) {
+                        fprintf(stderr, "bktr-reconstruct: chunk decrypt failed\n");
+                        final_rc = 1;
+                        break;
+                    }
+                    cur = read_end;
+                }
+            } else {
+                if (fseeko(base_f, (off_t)prev_phys, SEEK_SET) != 0) { final_rc = 1; break; }
+                FILE *append = fopen(out_path, "ab");
+                if (!append) { final_rc = 1; break; }
+                unsigned char buf[1 << 20];
+                uint64_t remaining = chunk_len;
+                while (remaining > 0) {
+                    size_t want = remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+                    size_t got = fread(buf, 1, want, base_f);
+                    if (got == 0) break;
+                    fwrite(buf, 1, got, append);
+                    remaining -= got;
+                }
+                fclose(append);
+            }
+        }
+        prev_virt = virt; prev_phys = phys; prev_is_patch = is_patch;
+        had_prev = 1;
+    }
+
+    fclose(base_f);
+    free(reloc_all);
+    free(subsec_entries);
+    free(key);
+    return final_rc;
 }

@@ -152,3 +152,9 @@ char *keys_file_lookup(const char *keys_path, const char *name, size_t expected_
     fclose(f);
     return result;
 }
+
+void make_scratch_template(const char *name_prefix, char *out_buf, size_t out_buf_size) {
+    const char *dir = getenv("TMPDIR");
+    if (!dir || dir[0] == '\0') dir = "/tmp";
+    snprintf(out_buf, out_buf_size, "%s/%sXXXXXX", dir, name_prefix);
+}

@@ -33,6 +33,7 @@ int cmd_romfs_extract_all(int argc, char **argv);
 int cmd_bktr_headers(int argc, char **argv);
 int cmd_bktr_relocations(int argc, char **argv);
 int cmd_bktr_subsections(int argc, char **argv);
+int cmd_bktr_reconstruct(int argc, char **argv);
 int cmd_nca_ctr_decrypt_section(int argc, char **argv);
 int cmd_nca_hierarchical_sha256_layer(int argc, char **argv);
 int cmd_nca_hierarchical_integrity_layer(int argc, char **argv);
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
             "  bktr-headers <decrypted_header_file> --section <0-3>\n"
             "  bktr-relocations <table_file>\n"
             "  bktr-subsections <table_file>\n"
+            "  bktr-reconstruct <update_nca> --keys <keys_file> --key-hex <hex32> --section <0-3> --base-romfs <path> -o <out_path>\n"
             "  decrypt-section <nca_path> --key-hex <hex32> --ctr <hex32> --offset <N> --size <N> -o <out_path>\n"
             "  nca-hierarchical-sha256-layer <decrypted_header_file> --section <0-3>\n"
             "  nca-hierarchical-integrity-layer <decrypted_header_file> --section <0-3>\n"
@@ -102,6 +104,7 @@ int main(int argc, char **argv) {
     if (strcmp(sub, "bktr-headers") == 0) return cmd_bktr_headers(sargc, sargv);
     if (strcmp(sub, "bktr-relocations") == 0) return cmd_bktr_relocations(sargc, sargv);
     if (strcmp(sub, "bktr-subsections") == 0) return cmd_bktr_subsections(sargc, sargv);
+    if (strcmp(sub, "bktr-reconstruct") == 0) return cmd_bktr_reconstruct(sargc, sargv);
     if (strcmp(sub, "decrypt-section") == 0) return cmd_nca_ctr_decrypt_section(sargc, sargv);
     if (strcmp(sub, "nca-hierarchical-sha256-layer") == 0) return cmd_nca_hierarchical_sha256_layer(sargc, sargv);
     if (strcmp(sub, "nca-hierarchical-integrity-layer") == 0) return cmd_nca_hierarchical_integrity_layer(sargc, sargv);

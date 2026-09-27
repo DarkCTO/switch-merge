@@ -829,10 +829,33 @@ suite still gives full coverage of every fixture that doesn't need one
 even in a clean checkout.
 
 **Total measured speedup, full pipeline compiled**: 3.9s vs 43.0s for
-the same real XCI merge (~11x) — see the roadmap entries below for the
-step-by-step progression (Phase 1's own honest finding that early
-phases barely moved the needle, through Phase 5's first large jump,
-to this final number).
+a real single-title XCI merge (~11x) — see the roadmap entries below
+for the step-by-step progression (Phase 1's own honest finding that
+early phases barely moved the needle, through Phase 5's first large
+jump, to this number).
+
+**BKTR reconstruction itself** (`bktr_reconstruct` — walking the
+relocation/subsection bucket tree to splice an update's own patched
+bytes and the base's unchanged bytes into one virtual romfs) was
+ported to C after the number above was recorded, closing what had
+been this project's one remaining gap. Real-world testing against
+this project's largest title (Super Smash Bros. Ultimate — 14.6GB
+base, 2 updates, 99 DLCs) found and fixed a genuine bug the smaller
+samples above never exercised: `smtool`'s scratch files (`mkstemp`/
+`mkdtemp`) hardcoded a literal `/tmp/...` template instead of
+consulting `$TMPDIR` — unlike bash's own `mktemp`, C's `mkstemp()`/
+`mkdtemp()` do NOT read `$TMPDIR` automatically, so every call site
+needed to build that template explicitly. This silently produced a
+truncated, corrupt Meta NCA on a machine where system `/tmp` filled up
+mid-merge, instead of a clear error. Fixed with a shared
+`make_scratch_template()` helper (`src/smtool/common.c`) used by every
+scratch-file call site. On the SAME real title, full merge time went
+from a crashing 15+-minute attempt to a succeeding **2m30s** run, with
+the BKTR reconstruction step alone measured at **11m13s (bash) → 10s
+(compiled), ~67x** on this title's real update. The final merged NSP
+was confirmed **byte-for-byte identical** to this project's own
+previously hardware-verified reference file for the same title — the
+strongest verification available, not just a bash-vs-C self-check.
 
 ## Known issues encountered
 
@@ -1369,7 +1392,7 @@ above.
       was built and checked), not because the pipeline needs them.
 - [ ] Handle DLC packs containing multiple `AddOnContent` titles in one NSP
       (only single-title DLC packs have been tested so far).
-- [ ] **`smtool` (C port), Phase 1 of 9 — pure struct/container parsing,
+- [x] **`smtool` (C port), Phase 1 of 9 — pure struct/container parsing,
       implemented.** The bash pipeline, while dependency-free, was measured
       to be roughly two orders of magnitude slower than the vendored C
       tools doing equivalent work (extracting a real 2.6GB XCI: 74.6s vs
@@ -1466,7 +1489,7 @@ above.
       Phase 3-5 entries directly below for what landed next): NCA
       content-key derivation, RomFs/BKTR readers, streaming AES-CTR
       content decryption, RomFs writer, NCA builder (Meta then Program).
-- [ ] **`smtool` (C port), Phase 2 of 9 — NCA header AES-XTS decrypt,
+- [x] **`smtool` (C port), Phase 2 of 9 — NCA header AES-XTS decrypt,
       implemented.** New `src/smtool/crypto.c`/`.h` wraps libcrypto's EVP
       API for raw AES-128-ECB (single/multi-block, no padding) — the one
       block-cipher primitive AES-XTS/key-unwrap/AES-CTR are all built
@@ -1507,7 +1530,7 @@ above.
       endianness regression at all) — skipped automatically if no real
       `~/.switch/prod.keys` is present on the machine running the tests
       (can't be committed, console-specific).
-- [ ] **`smtool` (C port), Phase 3 of 9 — NCA content-key derivation,
+- [x] **`smtool` (C port), Phase 3 of 9 — NCA content-key derivation,
       implemented.** New subcommands in `src/smtool/nca_content.c`:
       `nca-crypto-type` (the effective master-key generation index),
       `nca-content-key-standard` (unwraps the header's own embedded
@@ -1532,7 +1555,7 @@ above.
       1G1R merge (titlekey-crypto NSP, standard-crypto XCI) still
       produces byte-for-byte identical output via the compiled and
       `--pure` paths.
-- [ ] **`smtool` (C port), Phase 4 of 9 — RomFs reader + BKTR bucket-tree
+- [x] **`smtool` (C port), Phase 4 of 9 — RomFs reader + BKTR bucket-tree
       reader, implemented.** New `src/smtool/romfs.c` ports
       `lib/romfs.sh`'s flat (`romfs-extract`) and full-recursive
       (`romfs-extract-all`) RomFs readers. New `src/smtool/bktr.c` ports
@@ -1563,7 +1586,7 @@ above.
       exercises BKTR reconstruction itself, only the Control-NCA RomFs
       read path) still produces byte-for-byte identical output via the
       compiled and `--pure` paths.
-- [ ] **`smtool` (C port), Phase 5 of 9 — streaming AES-CTR content
+- [x] **`smtool` (C port), Phase 5 of 9 — streaming AES-CTR content
       decryption, implemented. This is the phase that delivers the real
       speedup.** New `src/smtool/nca_decrypt.c`: `decrypt-section`
       (streams AES-128-CTR decryption via libcrypto's EVP streaming API
@@ -1589,7 +1612,7 @@ above.
       (`--pure`) for the same XCI merge, roughly a 4x speedup, confirming
       the honest caveat from Phase 1's own entry above (the big win was
       always expected here, not in the small struct-parsing phases).
-- [ ] **`smtool` (C port), Phase 6 of 9 — RomFs writer, implemented.**
+- [x] **`smtool` (C port), Phase 6 of 9 — RomFs writer, implemented.**
       New `src/smtool/romfs_build.c` ports `lib/romfs_build.sh` (itself a
       port of hacpack's own `romfs_build`) — full directory-tree walk,
       the same TWO different sort orderings the bash version draws
@@ -1638,7 +1661,7 @@ above.
       copy-paste offset mixup), which produced a same-size but
       structurally wrong container that failed to round-trip at all
       until corrected against `lib/romfs.sh`'s own documented field list.
-- [ ] **`smtool` (C port), Phase 7 of 9 — NCA builder: Meta NCA,
+- [x] **`smtool` (C port), Phase 7 of 9 — NCA builder: Meta NCA,
       implemented.** New `src/smtool/nca_build.c` ports `lib/nca_build.sh`'s
       cnmt-writing and Meta-NCA-assembly half: `build-cnmt` (writes a
       `PackagedContentMeta` file — header, `Application`/`AddOnContent`
@@ -1683,7 +1706,7 @@ above.
       cnmt was extracted and confirmed to have a genuinely correct,
       self-verifying SHA256 digest over its own preceding bytes.
 
-- [ ] **`smtool` (C port), Phase 8 of 9 — NCA builder: Program NCA,
+- [x] **`smtool` (C port), Phase 8 of 9 — NCA builder: Program NCA,
       implemented, AND cutover wired.** New `build-program-nca`
       subcommand in `src/smtool/nca_build.c` completes the NCA-building
       half: exefs (PFS0 pack with `main.npdm`'s ACID sig/key zeroed,
@@ -1743,6 +1766,54 @@ above.
       confirming the Meta-NCA-building path (hash-table construction,
       two-pass digest rebuild) was itself a meaningful further cost the
       earlier phases hadn't yet touched.
+- [x] **`smtool` (C port), Phase 9 — BKTR reconstruction, implemented,
+      closing the port's one remaining gap.** New `bktr-reconstruct`
+      subcommand in `src/smtool/bktr.c` ports `lib/bktr.sh`'s own
+      `bktr_reconstruct` — the actual relocation-table walk that splices
+      an update's own patched bytes (decrypted per-subsection, with the
+      correct subsection `ctr_val` spliced into the AES-CTR counter) and
+      the base's unchanged bytes into one virtual romfs — reusing every
+      already-verified Phase 3-5 primitive in-process (`nca_section_info`,
+      `nca_content_ctr`, streaming AES-CTR decrypt) rather than needing
+      new crypto of its own. Wired into `switch-merge.sh` via a new
+      `op_bktr_reconstruct` wrapper replacing the bash call site.
+
+      This phase wasn't attempted earlier in the port because no real
+      base+update NSP pair was available to verify a C port of the
+      reconstruction LOOP against — every earlier phase's verification
+      used base-only samples. Testing against this project's own largest
+      real title (Super Smash Bros. Ultimate — 14.6GB base, 2 updates, 99
+      DLCs) both closed that gap and surfaced a real, separate bug the
+      smaller earlier samples never exercised: `smtool`'s scratch files
+      (`mkstemp`/`mkdtemp` across `bktr.c` and `nca_build.c`) hardcoded a
+      literal `/tmp/...` template — unlike bash's own `mktemp`, C's
+      `mkstemp()`/`mkdtemp()` do NOT consult `$TMPDIR` automatically, so
+      every one of these call sites needed to build that template
+      explicitly. On a machine where system `/tmp` filled up mid-merge,
+      this silently produced a truncated, corrupt Meta NCA instead of a
+      clear error — confirmed by reproducing the exact failure
+      ("could not read PFS0 header at offset 0") in isolation, then
+      fixing it with a shared `make_scratch_template()` helper
+      (`src/smtool/common.c`) that every scratch-file call site now uses.
+
+      **Verified at real scale, multiple independent ways**: the
+      reconstructed 17.6GB romfs matched BOTH `lib/bktr.sh`'s own bash
+      reconstruction (`cmp`, byte-for-byte across the full output) AND
+      `hactool --basenca`'s independent reconstruction of the same real
+      update (`diff -r` against the extracted directory tree, zero
+      differences) — the same dual-verification standard this project's
+      original bash BKTR port used. The full real merge (base + both
+      updates + all 99 DLCs) was re-run end-to-end after the fix and
+      succeeded in 2m30s, versus the original attempt's 15+ minutes
+      before it crashed on the `$TMPDIR` bug — and the resulting merged
+      NSP was confirmed **byte-for-byte identical** to this project's own
+      previously hardware-verified reference file for this exact title
+      (`Super Smash Bros. Ultimate [01006A800016E000][13.0.5][99].nsp`),
+      the strongest verification available since it's confirmed working
+      on a real console, not just self-consistent between this project's
+      own implementations. Measured speedup on just the BKTR
+      reconstruction step for this title: **11m13s (bash) → 10s
+      (compiled), ~67x**.
 - [x] XCI input — implemented: `.xci` (gamecard dump) files are now a valid
       input alongside `.nsp`, auto-detected by extension the same
       zero-flag way everything else is. New `lib/hfs0.sh` reads HFS0

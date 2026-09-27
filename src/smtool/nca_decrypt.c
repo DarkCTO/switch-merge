@@ -44,6 +44,88 @@ static int parse_offset_arg(const char *s, uint64_t *out) {
     return 0;
 }
 
+/* ctr_decrypt_range_impl - shared core of nca_ctr_decrypt_range/
+ * nca_ctr_decrypt_range_append/cmd_nca_ctr_decrypt_section: streams
+ * byte_size bytes at byte_offset in nca_path through AES-128-CTR,
+ * opening out_path with the given fopen mode ("wb" to create/truncate,
+ * "ab" to append). */
+static int ctr_decrypt_range_impl(const char *nca_path, const unsigned char key[16], const unsigned char ctr[16],
+                                   uint64_t byte_offset, uint64_t byte_size, const char *out_path, const char *fopen_mode) {
+    FILE *in = fopen(nca_path, "rb");
+    if (!in) {
+        fprintf(stderr, "could not open %s\n", nca_path);
+        return 1;
+    }
+    if (fseeko(in, (off_t)byte_offset, SEEK_SET) != 0) {
+        fprintf(stderr, "could not seek to offset %llu in %s\n", (unsigned long long)byte_offset, nca_path);
+        fclose(in);
+        return 1;
+    }
+    FILE *out = fopen(out_path, fopen_mode);
+    if (!out) {
+        fprintf(stderr, "could not open %s for writing\n", out_path);
+        fclose(in);
+        return 1;
+    }
+
+    EVP_CIPHER_CTX *cipher = EVP_CIPHER_CTX_new();
+    int rc = 1;
+    if (cipher && EVP_DecryptInit_ex(cipher, EVP_aes_128_ctr(), NULL, key, ctr) == 1) {
+        unsigned char inbuf[1 << 20];
+        unsigned char outbuf[(1 << 20) + 16];
+        uint64_t remaining = byte_size;
+        rc = 0;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(inbuf) ? (size_t)remaining : sizeof(inbuf);
+            size_t got = fread(inbuf, 1, chunk, in);
+            if (got == 0) {
+                fprintf(stderr, "ctr-decrypt: short read from %s\n", nca_path);
+                rc = 1;
+                break;
+            }
+            int outlen = 0;
+            if (EVP_DecryptUpdate(cipher, outbuf, &outlen, inbuf, (int)got) != 1) {
+                fprintf(stderr, "ctr-decrypt: AES-CTR decrypt failed\n");
+                rc = 1;
+                break;
+            }
+            if (outlen > 0 && fwrite(outbuf, 1, (size_t)outlen, out) != (size_t)outlen) {
+                fprintf(stderr, "ctr-decrypt: short write to %s\n", out_path);
+                rc = 1;
+                break;
+            }
+            remaining -= got;
+        }
+        if (rc == 0) {
+            int outlen = 0;
+            if (EVP_DecryptFinal_ex(cipher, outbuf, &outlen) != 1) {
+                fprintf(stderr, "ctr-decrypt: AES-CTR finalize failed\n");
+                rc = 1;
+            } else if (outlen > 0 && fwrite(outbuf, 1, (size_t)outlen, out) != (size_t)outlen) {
+                fprintf(stderr, "ctr-decrypt: short write to %s\n", out_path);
+                rc = 1;
+            }
+        }
+    } else {
+        fprintf(stderr, "ctr-decrypt: could not initialize AES-CTR cipher\n");
+    }
+    if (cipher) EVP_CIPHER_CTX_free(cipher);
+
+    fclose(in);
+    fclose(out);
+    return rc;
+}
+
+int nca_ctr_decrypt_range(const char *nca_path, const unsigned char key[16], const unsigned char ctr[16],
+                           uint64_t byte_offset, uint64_t byte_size, const char *out_path) {
+    return ctr_decrypt_range_impl(nca_path, key, ctr, byte_offset, byte_size, out_path, "wb");
+}
+
+int nca_ctr_decrypt_range_append(const char *nca_path, const unsigned char key[16], const unsigned char ctr[16],
+                                  uint64_t byte_offset, uint64_t byte_size, const char *out_path) {
+    return ctr_decrypt_range_impl(nca_path, key, ctr, byte_offset, byte_size, out_path, "ab");
+}
+
 /* cmd_nca_ctr_decrypt_section <nca_path> --keys <keys> --key-hex <hex32>
  *   --ctr <hex32> --offset <N> --size <N> -o <out_path>
  * Decrypts size bytes starting at offset in nca_path using AES-128-CTR
@@ -86,75 +168,7 @@ int cmd_nca_ctr_decrypt_section(int argc, char **argv) {
         return 1;
     }
 
-    FILE *in = fopen(nca_path, "rb");
-    if (!in) {
-        fprintf(stderr, "could not open %s\n", nca_path);
-        free(key);
-        free(ctr);
-        return 1;
-    }
-    if (fseeko(in, (off_t)byte_offset, SEEK_SET) != 0) {
-        fprintf(stderr, "could not seek to offset %llu in %s\n", (unsigned long long)byte_offset, nca_path);
-        fclose(in);
-        free(key);
-        free(ctr);
-        return 1;
-    }
-
-    FILE *out = fopen(out_path, "wb");
-    if (!out) {
-        fprintf(stderr, "could not open %s for writing\n", out_path);
-        fclose(in);
-        free(key);
-        free(ctr);
-        return 1;
-    }
-
-    EVP_CIPHER_CTX *cipher = EVP_CIPHER_CTX_new();
-    int rc = 1;
-    if (cipher && EVP_DecryptInit_ex(cipher, EVP_aes_128_ctr(), NULL, key, ctr) == 1) {
-        unsigned char inbuf[1 << 20];
-        unsigned char outbuf[(1 << 20) + 16];
-        uint64_t remaining = byte_size;
-        rc = 0;
-        while (remaining > 0) {
-            size_t chunk = remaining < sizeof(inbuf) ? (size_t)remaining : sizeof(inbuf);
-            size_t got = fread(inbuf, 1, chunk, in);
-            if (got == 0) {
-                fprintf(stderr, "decrypt-section: short read from %s\n", nca_path);
-                rc = 1;
-                break;
-            }
-            int outlen = 0;
-            if (EVP_DecryptUpdate(cipher, outbuf, &outlen, inbuf, (int)got) != 1) {
-                fprintf(stderr, "decrypt-section: AES-CTR decrypt failed\n");
-                rc = 1;
-                break;
-            }
-            if (outlen > 0 && fwrite(outbuf, 1, (size_t)outlen, out) != (size_t)outlen) {
-                fprintf(stderr, "decrypt-section: short write to %s\n", out_path);
-                rc = 1;
-                break;
-            }
-            remaining -= got;
-        }
-        if (rc == 0) {
-            int outlen = 0;
-            if (EVP_DecryptFinal_ex(cipher, outbuf, &outlen) != 1) {
-                fprintf(stderr, "decrypt-section: AES-CTR finalize failed\n");
-                rc = 1;
-            } else if (outlen > 0 && fwrite(outbuf, 1, (size_t)outlen, out) != (size_t)outlen) {
-                fprintf(stderr, "decrypt-section: short write to %s\n", out_path);
-                rc = 1;
-            }
-        }
-    } else {
-        fprintf(stderr, "decrypt-section: could not initialize AES-CTR cipher\n");
-    }
-    if (cipher) EVP_CIPHER_CTX_free(cipher);
-
-    fclose(in);
-    fclose(out);
+    int rc = nca_ctr_decrypt_range(nca_path, key, ctr, byte_offset, byte_size, out_path);
     free(key);
     free(ctr);
     return rc;

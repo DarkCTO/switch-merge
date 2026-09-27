@@ -136,7 +136,7 @@ static int nca_content_key_titlekey(const unsigned char titlekey[16], int gen, c
  *   bytes 8-15: the section's absolute byte offset within the NCA,
  *               right-shifted by 4 (counted in 16-byte AES-block units),
  *               encoded BIG-ENDIAN. */
-static void nca_content_ctr(const unsigned char section_ctr_raw[8], uint64_t byte_offset, unsigned char out_ctr[16]) {
+void nca_content_ctr(const unsigned char section_ctr_raw[8], uint64_t byte_offset, unsigned char out_ctr[16]) {
     for (int i = 0; i < 8; i++) out_ctr[i] = section_ctr_raw[7 - i];
     uint64_t block_offset = byte_offset / 0x10;
     for (int i = 0; i < 8; i++) out_ctr[8 + i] = (unsigned char)((block_offset >> ((7 - i) * 8)) & 0xFF);
@@ -147,15 +147,7 @@ static void nca_content_ctr(const unsigned char section_ctr_raw[8], uint64_t byt
  * section_num*0x10, MediaStartOffset/MediaEndOffset in 0x200-byte media
  * units) and the corresponding FS header (0x400 + section_num*0x200,
  * EncryptionType at +0x2, SectionCTR at +0x140). */
-typedef struct {
-    int present;
-    uint64_t offset;
-    uint64_t size;
-    int crypt_type;
-    unsigned char ctr[16];
-} nca_section_info_t;
-
-static void nca_section_info(const unsigned char *header, int section_num, nca_section_info_t *out) {
+void nca_section_info(const unsigned char *header, int section_num, nca_section_info_t *out) {
     const unsigned char *entry = header + 0x240 + section_num * 0x10;
     uint32_t start_units = (uint32_t)entry[0] | ((uint32_t)entry[1] << 8) | ((uint32_t)entry[2] << 16) | ((uint32_t)entry[3] << 24);
     uint32_t end_units = (uint32_t)entry[4] | ((uint32_t)entry[5] << 8) | ((uint32_t)entry[6] << 16) | ((uint32_t)entry[7] << 24);

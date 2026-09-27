@@ -326,6 +326,22 @@ op_nca_hierarchical_integrity_data_layer() {
     fi
 }
 
+# op_bktr_reconstruct <update_nca> <update_key_hex> <update_section_num> <base_romfs_decrypted_path> <out_path>
+# Same contract as bktr_reconstruct (lib/bktr.sh) - reconstructs the
+# update's full virtual romfs by walking the relocation/subsection
+# bucket-tree. update_nca/update_section_num identify the update's own
+# Program NCA and which section is the BKTR-delta romfs;
+# base_romfs_decrypted_path must be the base Program NCA's own romfs
+# SECTION already decrypted to plaintext (same contract as the bash
+# function - see that file's own header comment).
+op_bktr_reconstruct() {
+    if [ "$PURE" -eq 1 ]; then
+        bktr_reconstruct "$1" "$KEYS" "$2" "$3" "$4" "$5"
+    else
+        "$SMTOOL" bktr-reconstruct "$1" --keys "$KEYS" --key-hex "$2" --section "$3" --base-romfs "$4" -o "$5"
+    fi
+}
+
 # op_romfs_extract <romfs_file> <entry_name> <out_path>
 op_romfs_extract() {
     if [ "$PURE" -eq 1 ]; then
@@ -907,7 +923,7 @@ merge_group() {
         local update_key
         update_key="$(op_nca_content_key_titlekey "$UPDATE_TITLEKEY" "$(op_nca_crypto_type "$PRIMARY_PROGRAM_SRC")")"
         local RECON_ROMFS_BLOB="$GROUP_WORK/recon_romfs_blob.bin"
-        bktr_reconstruct "$PRIMARY_PROGRAM_SRC" "$KEYS" "$update_key" "$update_romfs_section" "$BASE_ROMFS_DECRYPTED" "$RECON_ROMFS_BLOB" || exit 1
+        op_bktr_reconstruct "$PRIMARY_PROGRAM_SRC" "$update_key" "$update_romfs_section" "$BASE_ROMFS_DECRYPTED" "$RECON_ROMFS_BLOB" || exit 1
         rm -f "$BASE_ROMFS_DECRYPTED"
 
         local RECON_EXEFS="$GROUP_WORK/recon_exefs"

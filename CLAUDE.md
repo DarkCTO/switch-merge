@@ -296,113 +296,81 @@ remaining dependencies are bash, `xxd`, `openssl`, and standard coreutils.
 
 1. Re-read `README.md` in full — it has the authoritative, kept-current
    pipeline description, known issues, and roadmap.
-0. **`smtool` (C port of the perf-critical pipeline) is DONE — all 9
-   planned phases landed, cutover complete.** See README's own dedicated
-   "smtool" section and its roadmap entries for full detail. Short
+0. **`smtool` (C port of the perf-critical pipeline) is DONE — fully
+   complete, no remaining gaps.** See README's own dedicated "smtool"
+   section and its roadmap entries (Phases 1-9) for full detail. Short
    version: the bash pipeline was measured ~100x slower than the
    vendored C tools on equivalent work, so `src/smtool/` (links
-   libcrypto) reimplements the whole performance-critical pipeline as
-   one-shot subcommands (`bin/smtool <subcommand> ...`); `switch-merge.sh`
-   calls it by default now, `--pure` routes back to the original bash as
-   a fully-supported slower fallback. Landed: pure struct/container
-   parsing (Phase 1: cnmt/NACP/ticket/PFS0/HFS0), NCA header AES-XTS
-   decrypt + RightsId (Phase 2: `nca_header.c` + `crypto.c`'s libcrypto
-   AES-128-ECB primitive), NCA content-key derivation (Phase 3:
-   `nca_content.c` - `nca-crypto-type`, `nca-content-key-standard`,
-   `nca-content-key-titlekey`, `nca-section-info`), RomFs reader + BKTR
-   bucket-tree PARSING only, not full reconstruction (Phase 4:
-   `romfs.c`, `bktr.c`), streaming AES-128-CTR content decryption +
-   hash-layer offset resolution (Phase 5: `nca_decrypt.c` - the first
-   phase with a large measured speedup), RomFs writer (Phase 6:
-   `romfs_build.c`), NCA builder Meta then Program (Phases 7-8:
-   `nca_build.c`, `pfs0-pack`, `nca_encrypt_header`), and the final
-   cutover wiring both builders into `switch-merge.sh` (Phase 8/9
-   combined - both builders landed together since Phase 7 deliberately
-   deferred wiring until Phase 8 was ready). **Total measured speedup,
-   full pipeline compiled: 3.9s vs 43.0s for the same real XCI merge,
-   ~11x.** Verified byte-for-byte against bash output on every fixture
-   in `tests/` (`bash tests/run.sh`, 24 passing) AND against full
-   real 1G1R merges, both titlekey-crypto and standard-crypto inputs
-   (compiled vs `--pure`, `cmp`-identical output every time).
+   libcrypto) reimplements the ENTIRE performance-critical pipeline —
+   including BKTR reconstruction, the one piece that stayed bash-only
+   through most of this work — as one-shot subcommands
+   (`bin/smtool <subcommand> ...`). `switch-merge.sh` calls it by
+   default; `--pure` is a fully-supported fallback to the original bash.
+   Every `op_*` wrapper in `switch-merge.sh` now has a working compiled
+   branch; there is no remaining bash-only pipeline step.
 
-   **Speed progression across phases, for context if this comes up
-   again**: Phase 1 alone barely moved the needle (real-file merge time
-   is I/O-bound on copying multi-GB partitions, not the small struct
-   parses that phase sped up) - Phase 5 (streaming AES-CTR content
-   decrypt) was the first phase with a large jump, ~4x - the final
-   number above (~11x) includes Phases 6-8's NCA-building work too,
-   which turned out to be a meaningful further cost on top of content
-   decryption alone. Don't re-measure any of this from scratch if
-   picking related work back up - it's already confirmed working and
-   fast for every phase that landed.
+   **Verified at real scale, the strongest way available**: tested
+   against this project's own largest and most demanding title (Super
+   Smash Bros. Ultimate — 14.6GB base, 2 updates, 99 DLCs), the full
+   merge now succeeds in **2m30s** (previously 15+ minutes before
+   crashing on a real bug this test surfaced — see below), and the
+   resulting merged NSP is **byte-for-byte identical** to this
+   project's own previously hardware-verified reference file for this
+   exact title — confirmed working on a real console, not just self-
+   consistent between bash and C. BKTR reconstruction alone measured
+   **11m13s (bash) → 10s (compiled), ~67x**, and its output was
+   cross-checked THREE independent ways: byte-for-byte against bash's
+   own `bktr_reconstruct`, byte-for-byte against `hactool --basenca`'s
+   independent reconstruction, and via the full merge's hardware-
+   reference match above.
+
+   **A real, genuine bug was found and fixed via this large-scale
+   test** (not caught by any smaller sample): `smtool`'s scratch files
+   (`mkstemp`/`mkdtemp` in `bktr.c` and `nca_build.c`) hardcoded a
+   literal `/tmp/...` template — unlike bash's own `mktemp`, C's
+   `mkstemp()`/`mkdtemp()` do NOT consult `$TMPDIR` automatically. When
+   the small system `/tmp` filled up mid-merge, this silently produced
+   a truncated, corrupt Meta NCA instead of a clear error. Fixed with a
+   shared `make_scratch_template()` helper (`src/smtool/common.c`) now
+   used by every scratch-file call site. **If ever touching scratch-file
+   handling in `src/smtool/` again, always route through
+   `make_scratch_template()` — never hardcode `/tmp`.**
+
+   **Speed progression across phases, for context**: Phase 1 alone
+   barely moved the needle (real-file merge time is I/O-bound on
+   copying multi-GB partitions, not the small struct parses that phase
+   sped up) - Phase 5 (streaming AES-CTR content decrypt) was the first
+   phase with a large jump, ~4x - the full builder pipeline (Phases
+   6-8) brought a single-title XCI merge to ~11x - and BKTR
+   reconstruction (the final piece) brought a real base+update title's
+   merge to the ~67x/2m30s numbers above. Don't re-measure any of this
+   from scratch if picking related work back up - it's already
+   confirmed working and fast.
 
    One pre-existing bash bug, unrelated to the C port, was found and
-   understood (not modified) while verifying Phase 6: `lib/romfs_build.sh`'s
-   own `romfs_build` breaks (corrupted, non-round-trippable output) if
-   `in_dir` is passed WITH a trailing slash - never surfaces in the real
-   pipeline (every real call site passes a `mktemp -d` path, never
-   trailing-slashed) but worth knowing if `romfs_build` is ever called
-   directly/manually again.
+   understood (not modified) while verifying the RomFs writer:
+   `lib/romfs_build.sh`'s own `romfs_build` breaks (corrupted, non-
+   round-trippable output) if `in_dir` is passed WITH a trailing slash -
+   never surfaces in the real pipeline (every real call site passes a
+   `mktemp -d` path, never trailing-slashed) but worth knowing if
+   `romfs_build` is ever called directly/manually again.
 
-   Phase 7 (NCA builder: Meta NCA, `nca_build.c`) also landed -
-   `build-cnmt`/`build-meta-nca`, plus `pfs0.c` gained its writer half
-   (`pfs0-pack`, deferred from Phase 1). Verified byte-for-byte against
-   bash's own two-pass digest flow AND independently against `nstool`
-   (real ground truth - confirmed the built NCA's ContentType/ProgID/
-   key-area and the embedded cnmt's own self-verifying digest, not just
-   agreement between this project's two implementations of itself). A
-   real, genuine C-port bug was caught here: an uninitialized stack
-   buffer left one reserved byte per content record as garbage,
-   corrupting every record after the first - caught immediately by the
-   very first byte-diff against real content NCAs.
-
-   Phase 8 (NCA builder: Program NCA) also landed, together with the
-   FULL CUTOVER: `op_nca_build_meta`/`op_nca_build_program` wrappers now
-   replace the last two bash NCA-building call sites in
-   `switch-merge.sh`. `smtool` is now required by default for every
-   part of the pipeline; `--pure` is the fully-supported, explicit
-   slow-path opt-in. Verified end-to-end on the very first real test:
-   built a real title's Program NCA from its own real exefs (6 files,
-   ~59MB)/romfs and matched `lib/nca_build.sh`'s own output byte-for-
-   byte, AND independently confirmed correct via `nstool` extraction
-   (5 of 6 files matched the pre-build originals exactly; `main.npdm`
-   differed only in the deliberately-zeroed 512-byte ACID region).
-   Full real 1G1R merges (plain titlekey-crypto NSP, single-title XCI,
-   two-title XCI) all produce byte-for-byte identical output via
-   compiled vs `--pure`, matching every earlier phase's own output too
-   (zero drift across the whole port). **Total measured speedup with
-   the full pipeline compiled: 3.9s vs 43.0s for the same real XCI
-   merge, ~11x** - up from Phase 5's 4x, since the Meta-NCA-building
-   path (hash-table construction, two-pass digest rebuild) was itself a
-   meaningful cost the earlier phases hadn't touched.
-
-   The 9-phase roadmap as originally planned is now functionally
-   complete. Still genuinely open, independent of that roadmap: full
-   BKTR *reconstruction*
-   (`bktr_reconstruct` itself, as opposed to the bucket-tree parsing
-   Phase 4 already ported) has NOT been ported to C yet - no real
-   update/BKTR-delta sample file was available this session to verify a
-   C port of the reconstruction loop against (every real update-NSP
-   pattern this project has tested requires a base+update PAIR, and only
-   base-only samples were on hand) - this remains bash-only and should be
-   revisited if a real update sample becomes available, independent of
-   the Phase 6-9 NCA-building work.
-
-   If the user asks to continue this, don't re-derive the design from
-   scratch — the phase ordering, subcommand-naming convention
+   If the user asks to extend this further (e.g. hand-rolling AES
+   instead of linking libcrypto, or adding more subcommands), don't
+   re-derive the design from scratch — the subcommand-naming convention
    (`<noun>-<verb>`, `KEY=VALUE` multi-field output), and `op_*`/`--pure`
    dispatch pattern are already decided; follow the existing shape in
    `switch-merge.sh` (`op_parse_cnmt`, `op_nca_rights_id`,
-   `op_nca_ctr_decrypt_section`, etc.) and `src/smtool/` (one `.c` file
-   per module, `main.c` dispatches by subcommand name, `nca_common.h`
-   shares the header-decrypt primitive across files) for the next phase
-   rather than inventing a new one. One real design decision Phase 2 made
-   that later phases kept following: `nca-header-decrypt` decrypts the
-   WHOLE 0xC00-byte header in one call rather than mirroring bash's
-   per-field `nca_header_field` - later C code (Phase 3's key derivation,
-   Phase 4's `bktr-headers`, Phase 5's layer resolvers) all read whatever
-   offset they need directly from an already-decrypted header file/buffer
-   in-process, never spawning another subcommand per field.
+   `op_bktr_reconstruct`, etc.) and `src/smtool/` (one `.c` file per
+   module, `main.c` dispatches by subcommand name, `nca_common.h` shares
+   primitives like the header-decrypt/section-info/CTR-decrypt
+   functions across files) rather than inventing a new one. One real
+   design decision made early that later phases kept following:
+   `nca-header-decrypt` decrypts the WHOLE 0xC00-byte header in one call
+   rather than mirroring bash's per-field `nca_header_field` - all
+   later C code reads whatever offset it needs directly from an
+   already-decrypted header file/buffer in-process, never spawning
+   another subcommand per field.
 2. **Vendored-tool elimination is done.** `nstool`/`hacpack`/`hactool` are
    all confirmed unused by the merge pipeline (see README roadmap's
    "fourth" through "eighth piece" entries for the full history: cnmt/NACP

@@ -63,4 +63,20 @@ char *keys_file_lookup(const char *keys_path, const char *name, size_t expected_
  * i.e. the natural human/printf reading order). */
 char *reverse_hex_bytes(const char *hex);
 
+/* make_scratch_template <name_prefix> <out_buf> <out_buf_size>
+ * Builds an mkstemp/mkdtemp template ("<scratch_dir>/<name_prefix>XXXXXX")
+ * honoring $TMPDIR (falling back to /tmp if unset), same convention every
+ * bash mktemp call in this project's lib dir scripts already follows -
+ * switch-merge.sh sets $TMPDIR to a project-local directory specifically
+ * so large scratch files (this tool's own multi-GB Program/Meta NCA
+ * intermediates included) don't land on a small system /tmp tmpfs.
+ * Unlike bash's own `mktemp`, C's mkstemp()/mkdtemp() do NOT consult
+ * $TMPDIR automatically - every caller must build this template
+ * explicitly, which is exactly what this function centralizes (a real
+ * bug this project hit once: several call sites hardcoded a literal
+ * "/tmp/smtool_..." template, which silently produced truncated/empty
+ * scratch files instead of a loud error when a small system /tmp filled
+ * up during a large real merge). */
+void make_scratch_template(const char *name_prefix, char *out_buf, size_t out_buf_size);
+
 #endif

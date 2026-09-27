@@ -234,7 +234,8 @@ static int hash_blocks(const char *src_path, uint64_t block_size, unsigned char 
 static int cmd_build_meta_nca_impl(const char *out_nca, const char *keys_path, const char *title_id_hex,
                                     uint32_t title_version, const char *program_nca, const char *control_nca,
                                     const char *legal_nca, const char *data_nca, const char *digest_hex) {
-    char work_cnmt[] = "/tmp/smtool_meta_cnmt_XXXXXX";
+    char work_cnmt[600];
+    make_scratch_template("smtool_meta_cnmt_", work_cnmt, sizeof(work_cnmt));
     int fd = mkstemp(work_cnmt);
     if (fd < 0) { fprintf(stderr, "build-meta-nca: mkstemp failed\n"); return 1; }
     close(fd);
@@ -266,9 +267,10 @@ static int cmd_build_meta_nca_impl(const char *out_nca, const char *keys_path, c
      * file's OWN basename as its PFS0 entry name, so the temp file must
      * be renamed to that name first (a plain mkstemp path's basename
      * would otherwise leak into the packed NSP/NCA). */
-    char cnmt_dir[] = "/tmp/smtool_meta_dir_XXXXXX";
+    char cnmt_dir[600];
+    make_scratch_template("smtool_meta_dir_", cnmt_dir, sizeof(cnmt_dir));
     if (!mkdtemp(cnmt_dir)) { fprintf(stderr, "build-meta-nca: mkdtemp failed\n"); remove(work_cnmt); return 1; }
-    char cnmt_named[512];
+    char cnmt_named[700];
     snprintf(cnmt_named, sizeof(cnmt_named), "%s/Application_%s.cnmt", cnmt_dir, title_id_hex);
     if (rename(work_cnmt, cnmt_named) != 0) {
         FILE *src = fopen(work_cnmt, "rb");
@@ -281,7 +283,7 @@ static int cmd_build_meta_nca_impl(const char *out_nca, const char *keys_path, c
         remove(work_cnmt);
     }
 
-    char pfs0_path[600];
+    char pfs0_path[700];
     snprintf(pfs0_path, sizeof(pfs0_path), "%s/pfs0.bin", cnmt_dir);
     {
         char *pack_argv[3] = { pfs0_path, cnmt_named, NULL };
@@ -572,11 +574,12 @@ int cmd_build_program_nca(int argc, char **argv) {
         return 1;
     }
 
-    char work_dir[] = "/tmp/smtool_program_XXXXXX";
+    char work_dir[600];
+    make_scratch_template("smtool_program_", work_dir, sizeof(work_dir));
     if (!mkdtemp(work_dir)) { fprintf(stderr, "build-program-nca: mkdtemp failed\n"); return 1; }
 
     /* --- Section 0: exefs (PFS0, HierarchicalSha256, 0x10000 hash blocks) --- */
-    char npdm_copy[600] = "";
+    char npdm_copy[700] = "";
     char *exefs_fixed[64];
     for (int i = 0; i < exefs_count; i++) {
         const char *base = strrchr(exefs_files[i], '/');
@@ -601,7 +604,7 @@ int cmd_build_program_nca(int argc, char **argv) {
         return 1;
     }
 
-    char exefs_pfs0[600];
+    char exefs_pfs0[700];
     snprintf(exefs_pfs0, sizeof(exefs_pfs0), "%s/exefs.pfs0", work_dir);
     {
         char *pack_argv[66];
@@ -666,7 +669,7 @@ int cmd_build_program_nca(int argc, char **argv) {
      * already for N=5) file size - confirmed by reading hacpack's exact
      * call site (ivfc_create_level writes TO path[b] FROM path[b+1],
      * size captured is path[b]'s own). */
-    char ivfc_path5[600], ivfc_path4[600], ivfc_path3[600], ivfc_path2[600], ivfc_path1[600], ivfc_path0[600];
+    char ivfc_path5[700], ivfc_path4[700], ivfc_path3[700], ivfc_path2[700], ivfc_path1[700], ivfc_path0[700];
     snprintf(ivfc_path5, sizeof(ivfc_path5), "%s/romfs.bin", work_dir);
     snprintf(ivfc_path4, sizeof(ivfc_path4), "%s/ivfc4.bin", work_dir);
     snprintf(ivfc_path3, sizeof(ivfc_path3), "%s/ivfc3.bin", work_dir);
