@@ -67,11 +67,17 @@ cd hactool && git apply /path/to/bin/patches/hactool-1.4.0-bktr-layout-fix.patch
 ## Usage
 
 ```
-./switch-merge.sh [-o <output_dir>] [-k keys.dat] [<nsp-or-xci-or-dir> ...]
+./switch-merge.sh [-o <output_dir>] [-k keys.dat] [--pure] [<nsp-or-xci-or-dir> ...]
 ```
 
 - `-o` output directory (defaults to `merged/` next to the script itself)
 - `-k` path to keys file (defaults to `~/.switch/prod.keys`)
+- `--pure` runs the original pure-bash implementation instead of the
+  compiled `bin/smtool` this script otherwise uses by default (see
+  "smtool" below) — slower, but has no compiled-binary dependency at
+  all beyond `xxd`/`openssl`. Without this flag, `bin/smtool` must
+  already be built (`make -C src/smtool`) or the script exits with an
+  error pointing at that build command.
 - every other argument is either an individual `.nsp`/`.xci` file or a
   directory (non-recursively globbed for `*.nsp`/`*.xci` files inside it),
   in any order — with **no** positional inputs at all, defaults to scanning
